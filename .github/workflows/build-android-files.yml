@@ -2,18 +2,33 @@ name: Build SiYuan Android files
 
 on:
   workflow_dispatch:
+    inputs:
+      branch:
+        description: '要构建的分支'
+        required: true
+        default: 'dev'
+
+permissions:
+  contents: read
 
 jobs:
   build-files:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout siyuan
+      - name: Checkout selected branch
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.inputs.branch }}
           submodules: recursive
 
-      - name: Set up Node
+      - name: Show repo info
+        run: |
+          pwd
+          git branch --show-current
+          ls -la
+
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -21,28 +36,32 @@ jobs:
       - name: Enable Corepack
         run: |
           corepack enable
+          corepack prepare pnpm@latest --activate
+          pnpm --version
 
       - name: Build app.zip
         working-directory: app
         run: |
-          corepack install
           pnpm install
-          pnpm run build:mobile || pnpm run build
+          pnpm run build:mobile
           zip -r app.zip appearance guide stage changelogs
+          ls -lh app.zip
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25.x'
+          go-version: 'stable'
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android NDK
+      - name: Install Android NDK and tools
         run: |
-          sdkmanager --install "ndk;27.2.12479018" "platforms;android-35" "build-tools;35.0.0"
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.2.12479018" >> $GITHUB_ENV
 
       - name: Install gomobile
         run: |
@@ -58,15 +77,16 @@ jobs:
         working-directory: kernel
         run: |
           gomobile bind -tags fts5 -ldflags "-s -w" -v -o kernel.aar -target android/arm64 -androidapi 26 ./mobile/
+          ls -lh kernel.aar
 
-      - name: Collect files
+      - name: Collect output files
         run: |
           mkdir -p output
           cp app/app.zip output/app.zip
           cp kernel/kernel.aar output/kernel.aar
           ls -lh output
 
-      - name: Upload files
+      - name: Upload app.zip and kernel.aar
         uses: actions/upload-artifact@v4
         with:
           name: siyuan-android-required-files
