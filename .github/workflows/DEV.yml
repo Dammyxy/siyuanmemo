@@ -1,4 +1,4 @@
-name: Build SiYuan Dev
+name: Build SiYuan Dev Win64
 
 on:
   workflow_dispatch:
@@ -12,49 +12,8 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows x64
-            os: windows-latest
-            goos: windows
-            goarch: amd64
-            kernel_path: ../app/kernel/SiYuan-Kernel.exe
-            ldflags_prefix: -s -w -H=windowsgui -X
-            electron_script: dist
-            artifact: siyuan-dev-windows
-
-          - name: Linux x64
-            os: ubuntu-24.04
-            goos: linux
-            goarch: amd64
-            kernel_path: ../app/kernel-linux/SiYuan-Kernel
-            ldflags_prefix: -s -w -X
-            electron_script: dist-linux
-            artifact: siyuan-dev-linux
-
-          - name: macOS x64
-            os: macos-latest
-            goos: darwin
-            goarch: amd64
-            kernel_path: ../app/kernel-darwin/SiYuan-Kernel
-            ldflags_prefix: -s -w -X
-            electron_script: dist-darwin
-            artifact: siyuan-dev-macos-x64
-
-          - name: macOS arm64
-            os: macos-latest
-            goos: darwin
-            goarch: arm64
-            kernel_path: ../app/kernel-darwin-arm64/SiYuan-Kernel
-            ldflags_prefix: -s -w -X
-            electron_script: dist-darwin-arm64
-            artifact: siyuan-dev-macos-arm64
+  build-win64:
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
@@ -63,8 +22,7 @@ jobs:
           ref: ${{ github.event.inputs.branch }}
           submodules: recursive
 
-      - name: Setup MSYS2 for Windows
-        if: runner.os == 'Windows'
+      - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -100,10 +58,15 @@ jobs:
         shell: bash
         run: pnpm run build
 
+      - name: Clean old package dirs
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force app\build, app\kernel, app\kernel-linux, app\kernel-darwin, app\kernel-darwin-arm64 -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force app\kernel | Out-Null
+
       - name: Install goversioninfo
-        if: runner.os == 'Windows'
         working-directory: kernel
-        shell: bash
+        shell: pwsh
         env:
           GO111MODULE: on
           CGO_ENABLED: 1
@@ -111,62 +74,33 @@ jobs:
           GOARCH: amd64
         run: |
           go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
-          goversioninfo -platform-specific=true -icon="resource/icon.ico" -manifest="resource/goversioninfo.exe.manifest"
+          $gopath = go env GOPATH
+          & "$gopath\bin\goversioninfo.exe" -platform-specific=true -icon="resource\icon.ico" -manifest="resource\goversioninfo.exe.manifest"
 
       - name: Build kernel
         working-directory: kernel
-        shell: bash
+        shell: pwsh
         env:
           GO111MODULE: on
           CGO_ENABLED: 1
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+          GOOS: windows
+          GOARCH: amd64
         run: |
-          mkdir -p "$(dirname "${{ matrix.kernel_path }}")"
-          go build -tags fts5 \
-            -o "${{ matrix.kernel_path }}" \
-            -v \
-            -ldflags "${{ matrix.ldflags_prefix }} github.com/siyuan-note/siyuan/kernel/util.Mode=prod" \
-            ./...
+          $module = go list -m
+          go build -tags fts5 -o "..\app\kernel\SiYuan-Kernel.exe" -v -ldflags "-s -w -H=windowsgui -X $module/util.Mode=prod"
 
-      - name: Disable macOS signing
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          keys = (
-              "identity:",
-              "provisioningProfile:",
-              "entitlements:",
-              "entitlementsInherit:",
-              "hardenedRuntime:",
-              "gatekeeperAssess:",
-          )
-
-          for name in ("electron-builder-darwin.yml", "electron-builder-darwin-arm64.yml"):
-              path = Path("app") / name
-              lines = path.read_text(encoding="utf-8").splitlines()
-              lines = [line for line in lines if not line.lstrip().startswith(keys)]
-              path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-          PY
-
-      - name: Build Electron package
+      - name: Build Windows installer
         working-directory: app
-        shell: bash
+        shell: pwsh
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: false
-        run: pnpm run ${{ matrix.electron_script }}
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        run: pnpm exec electron-builder --config electron-builder.yml --publish=never
 
-      - name: Upload artifact
+      - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: siyuan-dev-win64
           if-no-files-found: error
           path: |
             app/build/*.exe
-            app/build/*.AppImage
-            app/build/*.tar.gz
-            app/build/*.deb
-            app/build/*.dmg
+            app/build/*.blockmap
