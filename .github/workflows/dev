@@ -1,0 +1,172 @@
+name: Build SiYuan Dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "要打包的分支"
+        required: true
+        default: "dev"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            goos: windows
+            goarch: amd64
+            kernel_path: ../app/kernel/SiYuan-Kernel.exe
+            ldflags_prefix: -s -w -H=windowsgui -X
+            electron_script: dist
+            artifact: siyuan-dev-windows
+
+          - name: Linux x64
+            os: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            kernel_path: ../app/kernel-linux/SiYuan-Kernel
+            ldflags_prefix: -s -w -X
+            electron_script: dist-linux
+            artifact: siyuan-dev-linux
+
+          - name: macOS x64
+            os: macos-latest
+            goos: darwin
+            goarch: amd64
+            kernel_path: ../app/kernel-darwin/SiYuan-Kernel
+            ldflags_prefix: -s -w -X
+            electron_script: dist-darwin
+            artifact: siyuan-dev-macos-x64
+
+          - name: macOS arm64
+            os: macos-latest
+            goos: darwin
+            goarch: arm64
+            kernel_path: ../app/kernel-darwin-arm64/SiYuan-Kernel
+            ldflags_prefix: -s -w -X
+            electron_script: dist-darwin-arm64
+            artifact: siyuan-dev-macos-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          submodules: recursive
+
+      - name: Setup MSYS2 for Windows
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          path-type: inherit
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-lua p7zip
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: kernel/go.mod
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Enable pnpm
+        working-directory: app
+        shell: bash
+        run: |
+          corepack enable
+          corepack prepare "$(node -p "require('./package.json').packageManager")" --activate
+          pnpm --version
+
+      - name: Install frontend dependencies
+        working-directory: app
+        shell: bash
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build frontend
+        working-directory: app
+        shell: bash
+        run: pnpm run build
+
+      - name: Install goversioninfo
+        if: runner.os == 'Windows'
+        working-directory: kernel
+        shell: bash
+        env:
+          GO111MODULE: on
+          CGO_ENABLED: 1
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
+          goversioninfo -platform-specific=true -icon="resource/icon.ico" -manifest="resource/goversioninfo.exe.manifest"
+
+      - name: Build kernel
+        working-directory: kernel
+        shell: bash
+        env:
+          GO111MODULE: on
+          CGO_ENABLED: 1
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p "$(dirname "${{ matrix.kernel_path }}")"
+          go build -tags fts5 \
+            -o "${{ matrix.kernel_path }}" \
+            -v \
+            -ldflags "${{ matrix.ldflags_prefix }} github.com/siyuan-note/siyuan/kernel/util.Mode=prod" \
+            ./...
+
+      - name: Disable macOS signing
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          keys = (
+              "identity:",
+              "provisioningProfile:",
+              "entitlements:",
+              "entitlementsInherit:",
+              "hardenedRuntime:",
+              "gatekeeperAssess:",
+          )
+
+          for name in ("electron-builder-darwin.yml", "electron-builder-darwin-arm64.yml"):
+              path = Path("app") / name
+              lines = path.read_text(encoding="utf-8").splitlines()
+              lines = [line for line in lines if not line.lstrip().startswith(keys)]
+              path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: Build Electron package
+        working-directory: app
+        shell: bash
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: pnpm run ${{ matrix.electron_script }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          path: |
+            app/build/*.exe
+            app/build/*.AppImage
+            app/build/*.tar.gz
+            app/build/*.deb
+            app/build/*.dmg
