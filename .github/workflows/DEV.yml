@@ -17,7 +17,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.inputs.branch }}
           submodules: recursive
@@ -31,40 +31,42 @@ jobs:
           install: mingw-w64-x86_64-gcc mingw-w64-x86_64-lua p7zip
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: kernel/go.mod
+          cache-dependency-path: kernel/go.sum
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 20
 
       - name: Enable pnpm
         working-directory: app
-        shell: bash
+        shell: pwsh
         run: |
           corepack enable
-          corepack prepare "$(node -p "require('./package.json').packageManager")" --activate
+          $pm = node -p "require('./package.json').packageManager"
+          corepack prepare $pm --activate
           pnpm --version
 
       - name: Install frontend dependencies
         working-directory: app
-        shell: bash
+        shell: pwsh
         run: pnpm install --no-frozen-lockfile
 
       - name: Build frontend
         working-directory: app
-        shell: bash
+        shell: pwsh
         run: pnpm run build
 
-      - name: Clean old package dirs
+      - name: Prepare package dirs
         shell: pwsh
         run: |
           Remove-Item -Recurse -Force app\build, app\kernel, app\kernel-linux, app\kernel-darwin, app\kernel-darwin-arm64 -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force app\kernel | Out-Null
 
-      - name: Install goversioninfo
+      - name: Generate Windows version info
         working-directory: kernel
         shell: pwsh
         env:
@@ -94,6 +96,7 @@ jobs:
         shell: pwsh
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+          CSC_IDENTITY_AUTO_DISCOVERY: false
         run: pnpm exec electron-builder --config electron-builder.yml --publish=never
 
       - name: Upload installer
