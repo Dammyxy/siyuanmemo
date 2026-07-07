@@ -80,27 +80,39 @@ func initDatabase(forceRebuild bool) {
 	disableCache()
 	defer enableCache()
 
-	util.IncBootProgress(2, "Initializing database...")
+	util.IncBootProgress(2, util.BootL10n(301, "Initializing database..."))
 
 	if forceRebuild {
 		ClearQueue()
+		closeDatabase()
+		util.RemoveDatabaseFile(util.DBPath)
 	}
 
 	initDBConnection()
+	initIndexQueue()
 	treenode.InitBlockTree(forceRebuild)
 
 	if !forceRebuild {
 		// 检查数据库结构版本，如果版本不一致的话说明改过表结构，需要重建
 		if util.DatabaseVer == getDatabaseVer() {
+			// 老库版本一致但缺少新加的列时，做幂等迁移（不升 DatabaseVer，避免全库重建丢失已嵌入向量）
+			migrateBlockEmbeddingsSchema()
+			recoverIndexQueue()
 			return
 		}
 		logging.LogInfof("the database structure is changed, rebuilding database...")
+		clearIndexQueueEntries()
 	}
 
 	// 不存在库或者版本不一致都会走到这里
 
+	closeDatabase()
+	treenode.CloseDatabase()
+	util.RemoveDatabaseFile(util.DBPath)
+	initDBConnection()
 	initDBTables()
-	vacuum()
+	util.RemoveDatabaseFile(util.BlockTreeDBPath)
+	treenode.InitBlockTree(true)
 
 	logging.LogInfof("reinitialized database [%s]", util.DBPath)
 }
@@ -145,22 +157,18 @@ func initDBTables() {
 		logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "create index [idx_blocks_root_id_id_hash] failed: %s", err)
 	}
 
-	_, err = db.Exec("DROP TABLE IF EXISTS blocks_fts")
-	if err != nil {
-		logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "drop table [blocks_fts] failed: %s", err)
-	}
-	_, err = db.Exec("CREATE VIRTUAL TABLE blocks_fts USING fts5(id UNINDEXED, parent_id UNINDEXED, root_id UNINDEXED, hash UNINDEXED, box UNINDEXED, path UNINDEXED, hpath UNINDEXED, name, alias, memo, tag, content, fcontent, markdown UNINDEXED, length UNINDEXED, type UNINDEXED, subtype UNINDEXED, ial, sort UNINDEXED, created UNINDEXED, updated UNINDEXED, tokenize=\"siyuan\")")
-	if err != nil {
-		logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "create table [blocks_fts] failed: %s", err)
-	}
-
-	_, err = db.Exec("DROP TABLE IF EXISTS blocks_fts_case_insensitive")
-	if err != nil {
-		logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "drop table [blocks_fts_case_insensitive] failed: %s", err)
-	}
-	_, err = db.Exec("CREATE VIRTUAL TABLE blocks_fts_case_insensitive USING fts5(id UNINDEXED, parent_id UNINDEXED, root_id UNINDEXED, hash UNINDEXED, box UNINDEXED, path UNINDEXED, hpath UNINDEXED, name, alias, memo, tag, content, fcontent, markdown UNINDEXED, length UNINDEXED, type UNINDEXED, subtype UNINDEXED, ial, sort UNINDEXED, created UNINDEXED, updated UNINDEXED, tokenize=\"siyuan case_insensitive\")")
-	if err != nil {
-		logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "create table [blocks_fts_case_insensitive] failed: %s", err)
+	if err = initFTSBlocks(); err != nil {
+		if isRecoverableDBFileError(err) {
+			logging.LogWarnf("create fts tables failed: %s, retrying with clean database...", err)
+			closeDatabase()
+			util.RemoveDatabaseFile(util.DBPath)
+			time.Sleep(time.Second)
+			initDBConnection()
+			err = initFTSBlocks()
+		}
+		if err != nil {
+			logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "create fts tables failed: %s", err)
+		}
 	}
 
 	_, err = db.Exec("DROP TABLE IF EXISTS spans")
@@ -223,6 +231,44 @@ func initDBTables() {
 	if err != nil {
 		logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "create table [refs] failed: %s", err)
 	}
+
+	_, err = db.Exec("DROP TABLE IF EXISTS block_embeddings")
+	if err != nil {
+		logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "drop table [block_embeddings] failed: %s", err)
+	}
+	_, err = db.Exec("CREATE TABLE block_embeddings (id TEXT PRIMARY KEY, root_id TEXT, box TEXT, path TEXT, embedding BLOB, model TEXT, content_len INTEGER, updated TEXT, fail_count INTEGER NOT NULL DEFAULT 0, last_tried INTEGER NOT NULL DEFAULT 0, ignored_type INTEGER NOT NULL DEFAULT 0)")
+	if err != nil {
+		logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "create table [block_embeddings] failed: %s", err)
+	}
+	_, err = db.Exec("CREATE INDEX idx_block_embeddings_root_id ON block_embeddings(root_id)")
+	if err != nil {
+		logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "create index [idx_block_embeddings_root_id] failed: %s", err)
+	}
+}
+
+func initFTSBlocks() (err error) {
+	_, err = db.Exec("DROP TABLE IF EXISTS blocks_fts")
+	if err != nil {
+		return
+	}
+	// 采用 external content 模式：blocks_fts 不再物理存储列值，仅维护倒排索引，
+	// 原文由 content 指向的 blocks 表提供，按 content_rowid（blocks 的隐式 rowid）回表取值。
+	// 因此 FTS 行的 rowid 必须与 blocks 行的 rowid 严格一致，所有写路径需显式传 rowid。
+	_, err = db.Exec("CREATE VIRTUAL TABLE blocks_fts USING fts5(id UNINDEXED, parent_id UNINDEXED, root_id UNINDEXED, hash UNINDEXED, box UNINDEXED, path UNINDEXED, hpath UNINDEXED, name, alias, memo, tag, content, fcontent, markdown UNINDEXED, length UNINDEXED, type UNINDEXED, subtype UNINDEXED, ial, sort UNINDEXED, created UNINDEXED, updated UNINDEXED, content='blocks', content_rowid='rowid', tokenize=\"" + ftsTokenize() + "\")")
+	return
+}
+
+func RebuildFTSIndex() (err error) {
+	if err = initFTSBlocks(); err != nil {
+		return
+	}
+
+	// external content 模式下使用 'rebuild' 命令重建索引：
+	// FTS5 会扫描 blocks 表，并用 blocks 的 rowid 作为 FTS rowid，保证两者对齐。
+	// 不能再用 INSERT...SELECT FROM blocks，否则 FTS 会自分配 rowid 导致与 blocks 脱钩。
+	stmt := "INSERT INTO blocks_fts(blocks_fts) VALUES('rebuild')"
+	_, err = db.Exec(stmt)
+	return
 }
 
 func initDBConnection() {
@@ -231,9 +277,9 @@ func initDBConnection() {
 	util.LogDatabaseSize(util.DBPath)
 	dsn := util.DBPath + "?_journal_mode=WAL" +
 		"&_synchronous=OFF" +
-		"&_mmap_size=2684354560" +
+		"&_mmap_size=4294967296" +
 		"&_secure_delete=OFF" +
-		"&_cache_size=-20480" +
+		"&_cache_size=-128000" +
 		"&_page_size=32768" +
 		"&_busy_timeout=7000" +
 		"&_ignore_check_constraints=ON" +
@@ -283,9 +329,9 @@ func initHistoryDBConnection() {
 	util.LogDatabaseSize(util.HistoryDBPath)
 	dsn := util.HistoryDBPath + "?_journal_mode=WAL" +
 		"&_synchronous=OFF" +
-		"&_mmap_size=2684354560" +
+		"&_mmap_size=4294967296" +
 		"&_secure_delete=OFF" +
-		"&_cache_size=-20480" +
+		"&_cache_size=-128000" +
 		"&_page_size=32768" +
 		"&_busy_timeout=7000" +
 		"&_ignore_check_constraints=ON" +
@@ -305,7 +351,21 @@ func initHistoryDBTables() {
 	historyDB.Exec("DROP TABLE histories_fts_case_insensitive")
 	_, err := historyDB.Exec("CREATE VIRTUAL TABLE histories_fts_case_insensitive USING fts5(id UNINDEXED, type UNINDEXED, op UNINDEXED, title, content, path UNINDEXED, created UNINDEXED, tokenize=\"siyuan case_insensitive\")")
 	if err != nil {
-		logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "create table [histories_fts_case_insensitive] failed: %s", err)
+		if isRecoverableDBFileError(err) {
+			logging.LogWarnf("create history fts table failed: %s, retrying with clean database...", err)
+			historyDB.Close()
+			historyDB = nil
+			if removeErr := os.RemoveAll(util.HistoryDBPath); nil != removeErr {
+				logging.LogErrorf("remove history database file [%s] failed: %s", util.HistoryDBPath, removeErr)
+			}
+			time.Sleep(time.Second)
+			initHistoryDBConnection()
+			historyDB.Exec("DROP TABLE histories_fts_case_insensitive")
+			_, err = historyDB.Exec("CREATE VIRTUAL TABLE histories_fts_case_insensitive USING fts5(id UNINDEXED, type UNINDEXED, op UNINDEXED, title, content, path UNINDEXED, created UNINDEXED, tokenize=\"siyuan case_insensitive\")")
+		}
+		if err != nil {
+			logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "create table [histories_fts_case_insensitive] failed: %s", err)
+		}
 	}
 }
 
@@ -343,9 +403,9 @@ func initAssetContentDBConnection() {
 	util.LogDatabaseSize(util.AssetContentDBPath)
 	dsn := util.AssetContentDBPath + "?_journal_mode=WAL" +
 		"&_synchronous=OFF" +
-		"&_mmap_size=2684354560" +
+		"&_mmap_size=4294967296" +
 		"&_secure_delete=OFF" +
-		"&_cache_size=-20480" +
+		"&_cache_size=-128000" +
 		"&_page_size=32768" +
 		"&_busy_timeout=7000" +
 		"&_ignore_check_constraints=ON" +
@@ -365,12 +425,27 @@ func initAssetContentDBTables() {
 	assetContentDB.Exec("DROP TABLE asset_contents_fts_case_insensitive")
 	_, err := assetContentDB.Exec("CREATE VIRTUAL TABLE asset_contents_fts_case_insensitive USING fts5(id UNINDEXED, name, ext, path, size UNINDEXED, updated UNINDEXED, content, tokenize=\"siyuan case_insensitive\")")
 	if err != nil {
-		logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "create table [asset_contents_fts_case_insensitive] failed: %s", err)
+		if isRecoverableDBFileError(err) {
+			logging.LogWarnf("create asset content fts table failed: %s, retrying with clean database...", err)
+			assetContentDB.Close()
+			assetContentDB = nil
+			if removeErr := os.RemoveAll(util.AssetContentDBPath); nil != removeErr {
+				logging.LogErrorf("remove asset content database file [%s] failed: %s", util.AssetContentDBPath, removeErr)
+			}
+			time.Sleep(time.Second)
+			initAssetContentDBConnection()
+			assetContentDB.Exec("DROP TABLE asset_contents_fts_case_insensitive")
+			_, err = assetContentDB.Exec("CREATE VIRTUAL TABLE asset_contents_fts_case_insensitive USING fts5(id UNINDEXED, name, ext, path, size UNINDEXED, updated UNINDEXED, content, tokenize=\"siyuan case_insensitive\")")
+		}
+		if err != nil {
+			logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "create table [asset_contents_fts_case_insensitive] failed: %s", err)
+		}
 	}
 }
 
 var (
 	caseSensitive  bool
+	hanSensitive   bool
 	indexAssetPath bool
 )
 
@@ -388,6 +463,24 @@ func SetCaseSensitive(b bool) {
 	}
 
 	util.SearchCaseSensitive = b
+}
+
+func SetHanSensitive(b bool) {
+	hanSensitive = b
+	util.SearchHanSensitive = b
+}
+
+// ftsTokenize 返回 blocks FTS 表的 tokenize 参数。
+// 分词器参数在 CREATE VIRTUAL TABLE 时固化，切换区分大小写或区分繁简后需要重建索引。
+func ftsTokenize() string {
+	ret := "siyuan"
+	if !caseSensitive {
+		ret += " case_insensitive"
+	}
+	if !hanSensitive {
+		ret += " han_insensitive"
+	}
+	return ret
 }
 
 func SetIndexAssetPath(b bool) {
@@ -648,6 +741,10 @@ func buildSpanFromNode(n *ast.Node, tree *parse.Tree, rootID, boxID, p string) (
 		}
 
 		dest := gulu.Str.FromBytes(destNode.Tokens)
+		if idx := strings.Index(dest, "?"); idx > 0 {
+			dest = dest[:idx]
+		}
+
 		var title string
 		if titleNode := n.ChildByType(ast.NodeLinkTitle); nil != titleNode {
 			title = gulu.Str.FromBytes(titleNode.Tokens)
@@ -998,40 +1095,33 @@ func deleteBlocksByIDs(tx *sql.Tx, ids []string) (err error) {
 		return
 	}
 
+	stmt = "DELETE FROM blocks_fts WHERE ROWID IN (" + strings.Join(rowIDs, ",") + ")"
+	if err = execStmtTx(tx, stmt); err != nil {
+		return
+	}
+
 	stmt = "DELETE FROM blocks WHERE ROWID IN (" + strings.Join(rowIDs, ",") + ")"
 	if err = execStmtTx(tx, stmt); err != nil {
 		return
 	}
 
-	if caseSensitive {
-		stmt = "DELETE FROM blocks_fts WHERE ROWID IN (" + strings.Join(rowIDs, ",") + ")"
-		if err = execStmtTx(tx, stmt); err != nil {
-			return
-		}
-	} else {
-		stmt = "DELETE FROM blocks_fts_case_insensitive WHERE ROWID IN (" + strings.Join(rowIDs, ",") + ")"
-		if err = execStmtTx(tx, stmt); err != nil {
-			return
-		}
+	stmt = "DELETE FROM block_embeddings WHERE id IN (" + strings.Join(ftsIDs, ",") + ")"
+	if err = execStmtTx(tx, stmt); err != nil {
+		return
 	}
 	return
 }
 
 func deleteBlocksByBoxTx(tx *sql.Tx, box string) (err error) {
-	stmt := "DELETE FROM blocks WHERE box = ?"
+	// external content 模式下 FTS 行需按 rowid 删除，rowid 来自 blocks 表，
+	// 因此必须先删 FTS（此时 blocks 尚在），再删 blocks，否则子查询查不到 rowid。
+	stmt := "DELETE FROM blocks_fts WHERE rowid IN (SELECT rowid FROM blocks WHERE box = ?)"
 	if err = execStmtTx(tx, stmt, box); err != nil {
 		return
 	}
-	if caseSensitive {
-		stmt = "DELETE FROM blocks_fts WHERE box = ?"
-		if err = execStmtTx(tx, stmt, box); err != nil {
-			return
-		}
-	} else {
-		stmt = "DELETE FROM blocks_fts_case_insensitive WHERE box = ?"
-		if err = execStmtTx(tx, stmt, box); err != nil {
-			return
-		}
+	stmt = "DELETE FROM blocks WHERE box = ?"
+	if err = execStmtTx(tx, stmt, box); err != nil {
+		return
 	}
 	ClearCache()
 	return
@@ -1118,20 +1208,14 @@ func deleteFileAnnotationRefsByBoxTx(tx *sql.Tx, box string) (err error) {
 }
 
 func deleteByRootID(tx *sql.Tx, rootID string, context map[string]any) (err error) {
-	stmt := "DELETE FROM blocks WHERE root_id = ?"
+	// external content 模式下 FTS 行需按 rowid 删除，必须先删 FTS 再删 blocks。
+	stmt := "DELETE FROM blocks_fts WHERE rowid IN (SELECT rowid FROM blocks WHERE root_id = ?)"
 	if err = execStmtTx(tx, stmt, rootID); err != nil {
 		return
 	}
-	if caseSensitive {
-		stmt = "DELETE FROM blocks_fts WHERE root_id = ?"
-		if err = execStmtTx(tx, stmt, rootID); err != nil {
-			return
-		}
-	} else {
-		stmt = "DELETE FROM blocks_fts_case_insensitive WHERE root_id = ?"
-		if err = execStmtTx(tx, stmt, rootID); err != nil {
-			return
-		}
+	stmt = "DELETE FROM blocks WHERE root_id = ?"
+	if err = execStmtTx(tx, stmt, rootID); err != nil {
+		return
 	}
 	stmt = "DELETE FROM spans WHERE root_id = ?"
 	if err = execStmtTx(tx, stmt, rootID); err != nil {
@@ -1165,20 +1249,14 @@ func batchDeleteByRootIDs(tx *sql.Tx, rootIDs []string, context map[string]any) 
 
 	ids := strings.Join(rootIDs, "','")
 	ids = "('" + ids + "')"
-	stmt := "DELETE FROM blocks WHERE root_id IN " + ids
+	// external content 模式下 FTS 行需按 rowid 删除，必须先删 FTS 再删 blocks。
+	stmt := "DELETE FROM blocks_fts WHERE rowid IN (SELECT rowid FROM blocks WHERE root_id IN " + ids + ")"
 	if err = execStmtTx(tx, stmt); err != nil {
 		return
 	}
-	if caseSensitive {
-		stmt = "DELETE FROM blocks_fts WHERE root_id IN " + ids
-		if err = execStmtTx(tx, stmt); err != nil {
-			return
-		}
-	} else {
-		stmt = "DELETE FROM blocks_fts_case_insensitive WHERE root_id IN " + ids
-		if err = execStmtTx(tx, stmt); err != nil {
-			return
-		}
+	stmt = "DELETE FROM blocks WHERE root_id IN " + ids
+	if err = execStmtTx(tx, stmt); err != nil {
+		return
 	}
 	stmt = "DELETE FROM spans WHERE root_id IN " + ids
 	if err = execStmtTx(tx, stmt); err != nil {
@@ -1206,20 +1284,14 @@ func batchDeleteByRootIDs(tx *sql.Tx, rootIDs []string, context map[string]any) 
 }
 
 func batchDeleteByPathPrefix(tx *sql.Tx, boxID, pathPrefix string) (err error) {
-	stmt := "DELETE FROM blocks WHERE box = ? AND path LIKE ?"
+	// external content 模式下 FTS 行需按 rowid 删除，必须先删 FTS 再删 blocks。
+	stmt := "DELETE FROM blocks_fts WHERE rowid IN (SELECT rowid FROM blocks WHERE box = ? AND path LIKE ?)"
 	if err = execStmtTx(tx, stmt, boxID, pathPrefix+"%"); err != nil {
 		return
 	}
-	if caseSensitive {
-		stmt = "DELETE FROM blocks_fts WHERE box = ? AND path LIKE ?"
-		if err = execStmtTx(tx, stmt, boxID, pathPrefix+"%"); err != nil {
-			return
-		}
-	} else {
-		stmt = "DELETE FROM blocks_fts_case_insensitive WHERE box = ? AND path LIKE ?"
-		if err = execStmtTx(tx, stmt, boxID, pathPrefix+"%"); err != nil {
-			return
-		}
+	stmt = "DELETE FROM blocks WHERE box = ? AND path LIKE ?"
+	if err = execStmtTx(tx, stmt, boxID, pathPrefix+"%"); err != nil {
+		return
 	}
 	stmt = "DELETE FROM spans WHERE box = ? AND path LIKE ?"
 	if err = execStmtTx(tx, stmt, boxID, pathPrefix+"%"); err != nil {
@@ -1249,17 +1321,6 @@ func batchUpdatePath(tx *sql.Tx, tree *parse.Tree, context map[string]any) (err 
 	stmt := "UPDATE blocks SET box = ?, path = ?, hpath = ? WHERE root_id = ?"
 	if err = execStmtTx(tx, stmt, tree.Box, tree.Path, tree.HPath, tree.ID); err != nil {
 		return
-	}
-	if caseSensitive {
-		stmt = "UPDATE blocks_fts SET box = ?, path = ?, hpath = ? WHERE root_id = ?"
-		if err = execStmtTx(tx, stmt, tree.Box, tree.Path, tree.HPath, tree.ID); err != nil {
-			return
-		}
-	} else {
-		stmt = "UPDATE blocks_fts_case_insensitive SET box = ?, path = ?, hpath = ? WHERE root_id = ?"
-		if err = execStmtTx(tx, stmt, tree.Box, tree.Path, tree.HPath, tree.ID); err != nil {
-			return
-		}
 	}
 
 	stmt = "UPDATE spans SET box = ?, path = ? WHERE root_id = ?"
@@ -1299,18 +1360,6 @@ func batchUpdateHPath(tx *sql.Tx, tree *parse.Tree, context map[string]any) (err
 		return
 	}
 
-	if caseSensitive {
-		stmt = "UPDATE blocks_fts SET hpath = ? WHERE root_id = ?"
-		if err = execStmtTx(tx, stmt, tree.HPath, tree.ID); err != nil {
-			return
-		}
-	} else {
-		stmt = "UPDATE blocks_fts_case_insensitive SET hpath = ? WHERE root_id = ?"
-		if err = execStmtTx(tx, stmt, tree.HPath, tree.ID); err != nil {
-			return
-		}
-	}
-
 	ClearCache()
 	evtHash := fmt.Sprintf("%x", sha256.Sum256([]byte(tree.ID)))[:7]
 	eventbus.Publish(eventbus.EvtSQLUpdateBlocksHPaths, context, 1, evtHash)
@@ -1318,6 +1367,7 @@ func batchUpdateHPath(tx *sql.Tx, tree *parse.Tree, context map[string]any) (err
 }
 
 func CloseDatabase() {
+	closeIndexQueue()
 	if err := db.Close(); err != nil {
 		logging.LogErrorf("close database failed: %s", err)
 	}
@@ -1366,6 +1416,71 @@ func query(query string, args ...any) (*sql.Rows, error) {
 		return nil, errors.New("database is nil")
 	}
 	return db.Query(query, args...)
+}
+
+func Exec(stmt string, args ...any) error {
+	stmt = strings.TrimSpace(stmt)
+	if "" == stmt {
+		return errors.New("statement is empty")
+	}
+
+	if nil == db {
+		return errors.New("database is nil")
+	}
+	_, err := db.Exec(stmt, args...)
+	return err
+}
+
+// migrateBlockEmbeddingsSchema 为 block_embeddings 幂等补充失败重试与忽略类型相关的列。
+// 不升 DatabaseVer（避免全库重建丢失已嵌入向量）；列已存在时跳过，老行自动取默认值 0。
+func migrateBlockEmbeddingsSchema() {
+	if nil == db {
+		return
+	}
+
+	// PRAGMA table_info 返回每列的定义，name 字段即列名
+	rows, err := db.Query("PRAGMA table_info(block_embeddings)")
+	if err != nil {
+		logging.LogErrorf("check block_embeddings columns failed: %s", err)
+		return
+	}
+	defer rows.Close()
+
+	existing := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dfltValue any
+		if err = rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			logging.LogErrorf("scan block_embeddings column info failed: %s", err)
+			return
+		}
+		existing[name] = true
+	}
+
+	// 表不存在（首次启动还没建）时 existing 为空，跳过；待 initDBTables 建表
+	if 0 == len(existing) {
+		return
+	}
+
+	addColumns := []string{
+		"ALTER TABLE block_embeddings ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE block_embeddings ADD COLUMN last_tried INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE block_embeddings ADD COLUMN ignored_type INTEGER NOT NULL DEFAULT 0",
+	}
+	// SQLite 的 ALTER TABLE ADD COLUMN 无法在单条语句里加多列，逐条执行；列已存在会报错，忽略
+	addColumn := func(name, ddl string) {
+		if existing[name] {
+			return
+		}
+		if _, err = db.Exec(ddl); err != nil {
+			logging.LogErrorf("add column [%s] failed: %s", name, err)
+		}
+	}
+	addColumn("fail_count", addColumns[0])
+	addColumn("last_tried", addColumns[1])
+	addColumn("ignored_type", addColumns[2])
 }
 
 func beginTx() (tx *sql.Tx, err error) {
@@ -1505,8 +1620,10 @@ func prepareExecInsertTx(tx *sql.Tx, stmtSQL string, args []any) (err error) {
 		tx.Rollback()
 		logging.LogErrorf("exec database stmt [%s] failed: %s\n  %s", stmtSQL, err, logging.ShortStack())
 
-		if strings.Contains(err.Error(), "database disk image is malformed") {
+		if isRecoverableDBFileError(err) {
+			closeDatabase()
 			util.RemoveDatabaseFile(util.DBPath)
+			time.Sleep(time.Second)
 			initDatabase(true)
 			logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "database disk image [%s] is malformed, please restart SiYuan kernel to rebuild it\n\t%s\n\t%v", util.DBPath, stmtSQL, args)
 		}
@@ -1520,7 +1637,10 @@ func execStmtTx(tx *sql.Tx, stmt string, args ...any) (err error) {
 		tx.Rollback()
 		logging.LogErrorf("exec database stmt [%s] failed: %s\n  %s", stmt, err, logging.ShortStack())
 
-		if strings.Contains(err.Error(), "database disk image is malformed") {
+		if isRecoverableDBFileError(err) {
+			closeDatabase()
+			util.RemoveDatabaseFile(util.DBPath)
+			time.Sleep(time.Second)
 			initDatabase(true)
 			logging.LogFatalf(logging.ExitCodeUnavailableDatabase, "database disk image [%s] is malformed, please restart SiYuan kernel to rebuild it\n\t%s\n\t%v", util.DBPath, stmt, args)
 		}
@@ -1576,12 +1696,24 @@ func ialAttr(ial, name string) (ret string) {
 	return
 }
 
+func isRecoverableDBFileError(err error) bool {
+	if nil == err {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "database disk image is malformed") ||
+		strings.Contains(errStr, "The parameter is incorrect") ||
+		strings.Contains(errStr, "unable to open database file")
+}
+
 func closeDatabase() {
 	if nil == db {
 		return
 	}
 
-	db.Close()
+	if err := db.Close(); err != nil {
+		logging.LogErrorf("close database failed: %s", err)
+	}
 	debug.FreeOSMemory()
 	db = nil
 	runtime.GC()
@@ -1615,6 +1747,9 @@ func SQLTemplateFuncs(templateFuncMap *template.FuncMap) {
 		return
 	}
 	(*templateFuncMap)["querySQL"] = func(stmt string) (ret []map[string]any) {
+		if err := CheckSingleStatement(stmt); err != nil {
+			return
+		}
 		ret, _ = Query(stmt, 1024)
 		return
 	}

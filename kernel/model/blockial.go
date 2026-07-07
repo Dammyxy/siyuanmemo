@@ -19,6 +19,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,7 +36,40 @@ import (
 	"github.com/siyuan-note/siyuan/kernel/util"
 )
 
-func SetBlockReminder(id string, timed string) (err error) {
+func SetCloudReminder(id, content, timed string) (err error) {
+	if !IsSubscriber() {
+		if "ios" == util.Container {
+			return errors.New(Conf.Language(122))
+		}
+		return errors.New(Conf.Language(29))
+	}
+
+	var timedMills int64
+	if "0" != timed {
+		t, e := dateparse.ParseIn(timed, time.Now().Location())
+		if nil != e {
+			return e
+		}
+		timedMills = t.UnixMilli()
+	}
+
+	content = strings.TrimSpace(content)
+	err = SetCloudBlockReminder(id, content, timedMills)
+	if err != nil {
+		return
+	}
+
+	if "0" == timed {
+		util.PushMsg(fmt.Sprintf(Conf.Language(109), content), 3000)
+	} else {
+		util.PushMsg(fmt.Sprintf(Conf.Language(101), time.UnixMilli(timedMills).Format("2006-01-02 15:04")), 5000)
+	}
+
+	IncSync()
+	return
+}
+
+func SetBlockReminder(id, timed string) (err error) {
 	if !IsSubscriber() {
 		if "ios" == util.Container {
 			return errors.New(Conf.Language(122))
@@ -68,6 +102,7 @@ func SetBlockReminder(id string, timed string) (err error) {
 	if ast.NodeDocument != node.Type && node.IsContainerBlock() {
 		node = treenode.FirstLeafBlock(node)
 	}
+
 	content := sql.NodeStaticContent(node, nil, false, false, false)
 	content = gulu.Str.SubStr(content, 128)
 	content = strings.ReplaceAll(content, editor.Zwsp, "")
@@ -186,11 +221,31 @@ func setNodeAttrs(node *ast.Node, tree *parse.Tree, nameValues map[string]string
 		ReloadFiletree()
 	}
 
-	go func() {
-		sql.FlushQueue()
-		refreshDynamicRefText(node, tree)
-	}()
+	if attrsAffectRefText(nameValues) {
+		go func() {
+			sql.FlushQueue()
+			refreshDynamicRefText(node, tree)
+		}()
+	}
 	return
+}
+
+// attrsAffectRefText 判断本次属性变更是否可能影响引用处的动态锚文本。
+//
+// 动态锚文本（ref-d）由定义块的 name（命名）或 title（文档标题）派生而来，
+// 仅当这两个属性发生变化时才需要调用 refreshDynamicRefText 去刷新引用方文档；
+// 其他属性（如锁定状态、滚动位置、自定义属性等）不影响锚文本，跳过刷新可避免
+// 对引用方文档的无意义落盘和历史记录生成（详见 https://github.com/siyuan-note/siyuan/issues/18058）。
+//
+// 注意：若后续动态锚文本的派生规则扩展到其他属性，需同步在本函数的白名单中补齐。
+func attrsAffectRefText(nameValues map[string]string) bool {
+	for name := range nameValues {
+		switch strings.ToLower(name) {
+		case "name", "title":
+			return true
+		}
+	}
+	return false
 }
 
 func setNodeAttrsWithTx(tx *Transaction, node *ast.Node, tree *parse.Tree, nameValues map[string]string) (err error) {
@@ -243,6 +298,10 @@ func setNodeAttrs0(node *ast.Node, nameValues map[string]string) (oldAttrs map[s
 			}
 		}
 
+		if lowerName == "icon" && "" != value {
+			value = normalizeIconValue(value)
+		}
+
 		if "" == value {
 			// 删除属性
 			if name != lowerName {
@@ -267,47 +326,6 @@ func setNodeAttrs0(node *ast.Node, nameValues map[string]string) (oldAttrs map[s
 	if html.EscapeAttrVal(oldAttrs["tags"]) != newAttrsUnEsc["tags"] {
 		ReloadTag()
 	}
-	return
-}
-
-func ResetBlockAttrs(id string, nameValues map[string]string) (err error) {
-	if util.ReadOnly {
-		return
-	}
-
-	FlushTxQueue()
-
-	tree, err := LoadTreeByBlockID(id)
-	if err != nil {
-		return err
-	}
-
-	node := treenode.GetNodeInTree(tree, id)
-	if nil == node {
-		return fmt.Errorf(Conf.Language(15), id)
-	}
-
-	oldAttrs := parse.IAL2Map(node.KramdownIAL)
-	node.ClearIALAttrs()
-
-	_, err = setNodeAttrs0(node, nameValues)
-	if err != nil {
-		return
-	}
-
-	if err = indexWriteTreeUpsertQueue(tree); err != nil {
-		return
-	}
-
-	IncSync()
-	cache.PutBlockIAL(node.ID, parse.IAL2Map(node.KramdownIAL))
-
-	pushBlockAttrs(oldAttrs, node)
-
-	go func() {
-		sql.FlushQueue()
-		refreshDynamicRefText(node, tree)
-	}()
 	return
 }
 
@@ -354,6 +372,29 @@ func validateChars(name string, startIdx, n int) bool {
 		}
 	}
 	return true
+}
+
+func normalizeIconValue(value string) string {
+	if strings.ContainsAny(value, "./") {
+		return value
+	}
+
+	allASCII := true
+	for _, r := range value {
+		if r > 127 {
+			allASCII = false
+			break
+		}
+	}
+	if allASCII {
+		return value
+	}
+
+	var parts []string
+	for _, r := range value {
+		parts = append(parts, strconv.FormatInt(int64(r), 16))
+	}
+	return strings.Join(parts, "-")
 }
 
 func pushBlockAttrs(oldAttrs map[string]string, node *ast.Node) {

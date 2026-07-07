@@ -1,7 +1,7 @@
 import {Menu} from "../../../plugin/Menu";
 import {transaction} from "../../wysiwyg/transaction";
 import {fetchPost, fetchSyncPost} from "../../../util/fetch";
-import {getDefaultOperatorByType, setFilter} from "./filter";
+import {getDefaultOperatorByType, getEditableFilters, hasFilterForColumn} from "./filter";
 import {genCellValue} from "./cell";
 import {getPropertiesHTML, openMenuPanel} from "./openMenuPanel";
 import {getLabelByNumberFormat} from "./number";
@@ -466,6 +466,11 @@ export const bindEditEvent = (options: {
                     blockID: options.blockID
                 });
                 (options.menuElement.querySelector('[data-type="addOption"]') as HTMLInputElement).focus();
+                // 添加选项后面板增高，需按首次锚点重新定位（sticky 锁底部，顶部上移避免溢出视口）
+                const prevTop = parseFloat(options.menuElement.dataset.positionTop);
+                if (!isNaN(prevTop)) {
+                    setPosition(options.menuElement, parseFloat(options.menuElement.dataset.positionX), prevTop, 0, 0, true);
+                }
             }
         });
     }
@@ -627,6 +632,11 @@ const addAttrViewColAnimation = (options: {
             } else {
                 previousElement = item.querySelector(".av__cell").previousElementSibling;
             }
+            // 分组视图下空分组或被虚拟滚动裁剪的行内可能找不到锚点单元格，此时跳过该行，
+            // 避免在 null 上调用 insertAdjacentHTML 抛出异常而中断整轮遍历 https://github.com/siyuan-note/siyuan/issues/18014
+            if (!previousElement) {
+                return;
+            }
             let html = "";
             if (item.classList.contains("av__row--header")) {
                 html = `<div class="av__cell av__cell--header" draggable="true" data-icon="${options.icon || ""}" data-col-id="${options.id}" data-dtype="${options.type}" data-wrap="false" style="width: 200px;">
@@ -642,7 +652,7 @@ const addAttrViewColAnimation = (options: {
     } else {
         options.blockElement.querySelector(".fn__hr").insertAdjacentHTML("beforebegin", `<div class="block__icons av__row" data-id="${nodeId}" data-col-id="${options.id}">
     <div class="block__icon" draggable="true"><svg><use xlink:href="#iconDrag"></use></svg></div>
-    <div class="block__logo ariaLabel fn__pointer" data-type="editCol" data-position="parentW" aria-label="${getColNameByType(options.type)}">
+    <div class="block__logo block__logo--icon ariaLabel fn__pointer" data-type="editCol" data-position="parentW" aria-label="${getColNameByType(options.type)}">
         <svg class="block__logoicon"><use xlink:href="#${getColIconByType(options.type)}"></use></svg>
         <span>${getColNameByType(options.type)}</span>
     </div>
@@ -668,7 +678,7 @@ const addAttrViewColAnimation = (options: {
         });
         const tabRect = options.blockElement.querySelector(".av__views").getBoundingClientRect();
         if (tabRect) {
-            setPosition(menuElement, tabRect.right - menuElement.clientWidth, tabRect.bottom, tabRect.height);
+            setPosition(menuElement, tabRect.right - menuElement.clientWidth, tabRect.bottom, tabRect.height, 0, true);
         }
         return;
     }
@@ -845,32 +855,39 @@ export const showColMenu = (protyle: IProtyle, blockElement: Element, cellElemen
             click() {
                 fetchPost("/api/av/renderAttributeView", {
                     id: avID,
+                    viewID,
+                    ignoreRows: true,
                 }, (response) => {
                     const avData = response.data as IAV;
-                    let filter: IAVFilter;
-                    avData.view.filters.find((item) => {
-                        if (item.column === colId && item.value.type === type) {
-                            filter = item;
-                            return true;
-                        }
-                    });
-                    let empty = false;
-                    if (!filter) {
-                        empty = true;
-                        filter = {
+                    // 该字段还没有筛选条件时，创建它的默认筛选条件（其它字段的筛选不影响）；
+                    // 已有该字段筛选时直接打开总筛选配置面板，避免每次重复新建
+                    if (!hasFilterForColumn(avData.view.filters, colId)) {
+                        const filter: IAVFilter = {
                             column: colId,
                             operator: getDefaultOperatorByType(type),
                             value: genCellValue(type, ""),
                         };
-                        avData.view.filters.push(filter);
+                        // 深拷贝旧值用于 undo，撤销时恢复完整筛选状态而非清空全部
+                        const oldFilters = JSON.parse(JSON.stringify(avData.view.filters));
+                        getEditableFilters(avData).push(filter);
+                        transaction(protyle, [{
+                            action: "setAttrViewFilters",
+                            avID,
+                            data: avData.view.filters,
+                            blockID: blockElement.getAttribute("data-node-id")
+                        }], [{
+                            action: "setAttrViewFilters",
+                            avID,
+                            data: oldFilters,
+                            blockID: blockElement.getAttribute("data-node-id")
+                        }]);
                     }
-                    setFilter({
-                        empty,
-                        filter,
+                    // 打开总筛选配置面板，复用已含新筛选条件的 avData，避免 openMenuPanel 二次 fetch 与刚提交的事务竞争而读到旧数据
+                    openMenuPanel({
                         protyle,
+                        blockElement,
+                        type: "filters",
                         data: avData,
-                        blockElement: blockElement,
-                        target: blockElement.querySelector(`.av__row--header .av__cell[data-col-id="${colId}"]`),
                     });
                 });
             }
@@ -1256,7 +1273,7 @@ export const removeCol = (options: {
         options.menuElement.innerHTML = getPropertiesHTML(options.fields);
         setPosition(options.menuElement,
             options.tabRect.right - options.menuElement.clientWidth, options.tabRect.bottom,
-            options.tabRect.height);
+            options.tabRect.height, 0, true);
     }
 };
 

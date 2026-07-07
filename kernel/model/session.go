@@ -257,7 +257,7 @@ func CheckAuth(c *gin.Context) {
 	//logging.LogInfof("check auth for [%s]", c.Request.RequestURI)
 	localhost := util.IsLocalHost(c.Request.RemoteAddr)
 
-	// 未设置访问授权码
+	// 未设置锁屏密码
 	if "" == Conf.AccessAuthCode {
 		// Skip the empty access authorization code check https://github.com/siyuan-note/siyuan/issues/9709
 		if util.SiYuanAccessAuthCodeBypass {
@@ -274,9 +274,9 @@ func CheckAuth(c *gin.Context) {
 		if !localhost ||
 			("" != clientIP && !util.IsLocalHostname(clientIP)) ||
 			("" != host && !util.IsLocalHost(host)) ||
-			("" != origin && !util.IsLocalOrigin(origin) && !strings.HasPrefix(origin, "chrome-extension://")) ||
+			("" != origin && !util.IsLocalOrigin(origin)) ||
 			("" != forwardedHost && !util.IsLocalHost(forwardedHost)) {
-			c.JSON(http.StatusUnauthorized, map[string]any{"code": -1, "msg": "Auth failed: for security reasons, please set [Access authorization code] when using non-127.0.0.1 access\n\n为安全起见，使用非 127.0.0.1 访问时请设置 [访问授权码]"})
+			c.JSON(http.StatusUnauthorized, map[string]any{"code": -1, "msg": "Auth failed: for security reasons, please set [Lock screen password] when using non-127.0.0.1 access\n\n为安全起见，使用非 127.0.0.1 访问时请设置 [锁屏密码]"})
 			c.Abort()
 			return
 		}
@@ -312,7 +312,7 @@ func CheckAuth(c *gin.Context) {
 			return
 		}
 		if strings.HasPrefix(c.Request.RequestURI, "/api/sync/performSync") {
-			if util.ContainerIOS == util.Container || util.ContainerAndroid == util.Container || util.ContainerHarmony == util.Container {
+			if util.IsMobileContainer() {
 				c.Set(RoleContextKey, RoleAdministrator)
 				c.Next()
 				return
@@ -331,7 +331,7 @@ func CheckAuth(c *gin.Context) {
 
 	// 通过 BasicAuth (header: Authorization)
 	if username, password, ok := c.Request.BasicAuth(); ok {
-		// 使用访问授权码作为密码
+		// 使用锁屏密码作为密码
 		if util.WorkspaceName == username && Conf.AccessAuthCode == password {
 			c.Set(RoleContextKey, RoleAdministrator)
 			c.Next()
@@ -448,6 +448,16 @@ func Recover(c *gin.Context) {
 	c.Next()
 }
 
+// Activity 记录用户写操作时间，用于 AutoFixIndex 的空闲判断。
+// 只认会产生数据变更的事务类请求（/api/transactions*），因为只有写操作才会引入索引不一致；
+// 读操作和前端定时轮询（如 /api/ai/embeddingStat）不计入，避免 SiYuan 开着却不操作时被判为活跃。
+func Activity(c *gin.Context) {
+	if strings.HasPrefix(c.Request.URL.Path, "/api/transactions") {
+		util.RefreshActivity()
+	}
+	c.Next()
+}
+
 var (
 	requestingLock = sync.Mutex{}
 	requesting     = map[string]*sync.Mutex{}
@@ -477,7 +487,9 @@ func ControlConcurrency(c *gin.Context) {
 		strings.HasPrefix(reqPath, "/api/search/") ||
 		strings.HasPrefix(reqPath, "/api/network/") ||
 		strings.HasPrefix(reqPath, "/api/broadcast/") ||
-		strings.HasPrefix(reqPath, "/es/") {
+		strings.HasPrefix(reqPath, "/api/ai/") ||
+		strings.HasPrefix(reqPath, "/es/") ||
+		strings.HasPrefix(reqPath, "/mcp") {
 		c.Next()
 		return
 	}

@@ -32,7 +32,6 @@ import (
 	"github.com/88250/lute/html"
 	"github.com/88250/lute/parse"
 	"github.com/88250/lute/render"
-	mmap "github.com/edsrzf/mmap-go"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/panjf2000/ants/v2"
 	"github.com/siyuan-note/dataparser"
@@ -247,7 +246,19 @@ func WriteTree(tree *parse.Tree) (size uint64, err error) {
 		return
 	}
 
-	if err = writeTreeByMmap(filePath, data); nil != err {
+	// 缓存与待写入数据一致时跳过落盘；缓存未命中时再读盘比对，避免无变更的重复写入
+	if cachedData, ok := cache.GetTreeData(tree.ID); ok {
+		if len(cachedData) == len(data) && bytes.Equal(cachedData, data) {
+			return
+		}
+	} else {
+		if diskData, readErr := filelock.ReadFile(filePath); nil == readErr && len(diskData) == len(data) && bytes.Equal(diskData, data) {
+			cache.SetTreeData(tree.ID, data)
+			return
+		}
+	}
+
+	if err = util.WriteFileByMmap(filePath, data); nil != err {
 		if err = writeTreeByWriteFile(filePath, data); nil != err {
 			return
 		}
@@ -274,39 +285,6 @@ func writeTreeByWriteFile(filePath string, data []byte) (err error) {
 	return
 }
 
-func writeTreeByMmap(filePath string, data []byte) (err error) {
-	f, err := filelock.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return
-	}
-	defer filelock.CloseFile(f)
-
-	if err = f.Truncate(int64(len(data))); err != nil {
-		msg := fmt.Sprintf("truncate file [%s] failed: %s", filePath, err)
-		logging.LogErrorf(msg)
-		err = errors.New(msg)
-		return
-	}
-
-	m, err := mmap.Map(f, mmap.RDWR, 0)
-	if err != nil {
-		msg := fmt.Sprintf("map file [%s] failed: %s", filePath, err)
-		logging.LogErrorf(msg)
-		err = errors.New(msg)
-		return
-	}
-	defer m.Unmap()
-
-	copy(m, data)
-	if err = m.Flush(); err != nil {
-		msg := fmt.Sprintf("flush data [%s] failed: %s", filePath, err)
-		logging.LogErrorf(msg)
-		err = errors.New(msg)
-		return
-	}
-	return
-}
-
 func prepareWriteTree(tree *parse.Tree) (data []byte, filePath string, err error) {
 	luteEngine := util.NewLute() // 不关注用户的自定义解析渲染选项
 
@@ -323,7 +301,7 @@ func prepareWriteTree(tree *parse.Tree) (data []byte, filePath string, err error
 	tree.Root.SetIALAttr("type", "doc")
 	renderer := render.NewJSONRenderer(tree, luteEngine.RenderOptions, luteEngine.ParseOptions)
 	data = renderer.Render()
-	data = removeUnescapedUnicodeNull(data)
+	data, _ = removeUnescapedUnicodeNull(data)
 	if !util.UseSingleLineSave {
 		buf := bytes.Buffer{}
 		buf.Grow(1024 * 1024 * 2)
@@ -342,14 +320,14 @@ func prepareWriteTree(tree *parse.Tree) (data []byte, filePath string, err error
 
 // removeUnescapedUnicodeNull 只移除未被转义的 `\u0000` 字面序列。
 // 判断方法：在匹配到 `\u0000` 时向前数连续的 `\` 个数，若为偶数则视为未转义并移除。
-func removeUnescapedUnicodeNull(data []byte) []byte {
+func removeUnescapedUnicodeNull(data []byte) (ret []byte, needFix bool) {
 	patLen := 6 // len(`\u0000`)
 	n := len(data)
 	if n < patLen {
-		return data
+		return data, false
 	}
 	if !bytes.Contains(data, []byte(`\u0000`)) {
-		return data
+		return data, false
 	}
 
 	dst := make([]byte, 0, n)
@@ -386,7 +364,7 @@ func removeUnescapedUnicodeNull(data []byte) []byte {
 		dst = append(dst, data[i])
 		i++
 	}
-	return dst
+	return dst, len(dst) != n
 }
 
 func afterWriteTree(tree *parse.Tree) {
@@ -396,10 +374,14 @@ func afterWriteTree(tree *parse.Tree) {
 
 // fixTreeJSONData 订正树 JSON 数据。
 func fixTreeJSONData(boxID, p string, jsonData []byte, luteEngine *lute.Lute) (data []byte, needFix bool, err error) {
-	jsonData = removeUnescapedUnicodeNull(jsonData)
-	ret, needFix, err := dataparser.ParseJSON(jsonData, luteEngine.ParseOptions)
+	jsonData, needFix = removeUnescapedUnicodeNull(jsonData)
+	ret, parseNeedFix, err := dataparser.ParseJSON(jsonData, luteEngine.ParseOptions)
+	if parseNeedFix {
+		needFix = true
+	}
 	if err != nil {
 		logging.LogErrorf("parse json [%s] to tree failed: %s", boxID+p, err)
+		err = fmt.Errorf("parse json [%s] to tree failed: %w", boxID+p, err)
 		return
 	}
 
@@ -459,6 +441,7 @@ func parseJSON2Tree(boxID, p string, jsonData []byte, luteEngine *lute.Lute) (re
 	ret, _, err = dataparser.ParseJSON(jsonData, luteEngine.ParseOptions)
 	if err != nil {
 		logging.LogErrorf("parse json [%s] to tree failed: %s", boxID+p, err)
+		err = fmt.Errorf("parse json [%s] to tree failed: %w", boxID+p, err)
 		return
 	}
 

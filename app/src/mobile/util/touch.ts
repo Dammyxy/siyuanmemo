@@ -2,16 +2,16 @@ import {
     hasClosestBlock,
     hasClosestByAttribute,
     hasClosestByClassName,
-    hasTopClosestByClassName, isInEmbedBlock,
+    hasTopClosestByClassName,
+    isInEmbedBlock,
 } from "../../protyle/util/hasClosest";
 import {closeModel, closePanel} from "./closePanel";
 import {popMenu} from "../menu";
 import {activeBlur} from "./keyboardToolbar";
-import {isIPhone} from "../../protyle/util/compatibility";
-import {App} from "../../index";
-import {globalTouchEnd, globalTouchStart} from "../../boot/globalEvent/touch";
+import {isChromeBrowser, isInAndroid, isInHarmony, isIPhone} from "../../protyle/util/compatibility";
 import {getRangeByPoint} from "../../protyle/util/selection";
 import {getCurrentEditor} from "../editor";
+import {Constants} from "../../constants";
 
 let clientX: number;
 let clientY: number;
@@ -23,6 +23,8 @@ let firstXY: "x" | "y";
 let lastClientX: number;    // 和起始方向不一致时，记录最后一次的 clientX
 let scrollBlock: boolean;
 let isFirstMove = true;
+// 长按进入多选的定时器
+let longPressTimer: number;
 
 const popSide = (render = true) => {
     if (render) {
@@ -33,26 +35,81 @@ const popSide = (render = true) => {
     }
 };
 
-export const handleTouchEnd = (event: TouchEvent, app: App) => {
-    const target = event.target as HTMLElement;
-    if (isIPhone() && globalTouchEnd(event, yDiff, time, app)) {
-        event.stopImmediatePropagation();
-        event.preventDefault();
-        return;
+// 清除长按进入多选的定时器
+const clearLongPress = () => {
+    if (longPressTimer) {
+        clearTimeout(longPressTimer);
+        longPressTimer = undefined;
     }
-    if (typeof yDiff === "undefined" && window.siyuan.mobile.editor.protyle.options.render.gutter) {
+};
+
+export const handleTouchUp = () => {
+    if (Date.now() - time < Constants.TIMEOUT_MULTIPLE_SELECT) {
+        clearLongPress();
+    }
+};
+
+export const handleTouchEnd = (event: TouchEvent) => {
+    const target = event.target as HTMLElement;
+    const currentTime = Date.now();
+    const editor = getCurrentEditor();
+    if (!isInHarmony() && !isInAndroid()) {
+        handleTouchUp();
+    }
+    if (Math.abs(clientX - event.changedTouches[0].clientX) < 5 && Math.abs(clientY - event.changedTouches[0].clientY) < 5) {
+        if (editor && editor.protyle.toolbar.isMultiSelectMode()) {
+            if (longPressTimer) {
+                event.stopImmediatePropagation();
+                event.preventDefault();
+                return;
+            }
+            // 多选模式
+            window.getSelection()?.removeAllRanges();
+            activeBlur();
+            const blockElement = hasClosestBlock(target);
+            if (blockElement) {
+                // 本次按压已在按住期间触发多选，松手时不切换选中态，仅消费该手势
+                blockElement.querySelectorAll(".protyle-wysiwyg--select").forEach(item => {
+                    item.classList.remove("protyle-wysiwyg--select");
+                });
+                const blockParentElement = hasClosestByClassName(blockElement.parentElement, "protyle-wysiwyg--select");
+                if (blockParentElement) {
+                    blockParentElement.classList.remove("protyle-wysiwyg--select");
+                }
+                blockElement.classList.toggle("protyle-wysiwyg--select");
+                editor.protyle.toolbar.subElement.querySelector(".multiSelectCount").textContent =
+                    editor.protyle.wysiwyg.element.querySelectorAll(".protyle-wysiwyg--select").length.toString();
+                event.stopImmediatePropagation();
+                event.preventDefault();
+            }
+        } else if (currentTime - time > Constants.TIMEOUT_LONGPRESS) {
+            // 长按：多选已在按住满阈值时触发，此处取消定时器避免重复触发
+            if (isIPhone() && !isChromeBrowser() && !window.siyuan.touchDragActive) {
+                target.dispatchEvent(new MouseEvent("contextmenu", {
+                    bubbles: true,
+                    cancelable: true,
+                    clientX: event.changedTouches[0].clientX,
+                    clientY: event.changedTouches[0].clientY,
+                }));
+            }
+            event.stopImmediatePropagation();
+            event.preventDefault();
+            return;
+        }
+    }
+    if (typeof yDiff === "undefined" && editor?.protyle.options.render.gutter) {
         const nodeElement = hasClosestBlock(target);
         if (nodeElement) {
-            if (nodeElement && (nodeElement.classList.contains("list") || nodeElement.classList.contains("li"))) {
+            if (nodeElement.classList.contains("list") || nodeElement.classList.contains("li")) {
                 // 光标在列表下部应显示右侧的元素，而不是列表本身。放在 windowEvent 中的 mousemove 下处理
                 return;
             }
             const embedElement = isInEmbedBlock(nodeElement);
             if (embedElement) {
-                window.siyuan.mobile.editor.protyle.gutter.render(window.siyuan.mobile.editor.protyle, embedElement);
+                editor.protyle.gutter.render(editor.protyle, embedElement);
                 return;
             }
-            window.siyuan.mobile.editor.protyle.gutter.render(window.siyuan.mobile.editor.protyle, nodeElement, target);
+            editor.protyle.gutter.render(editor.protyle, nodeElement, target);
         }
     }
     isFirstMove = true;
@@ -80,7 +137,7 @@ export const handleTouchEnd = (event: TouchEvent, app: App) => {
     }
 
     let scrollEnable = false;
-    if (new Date().getTime() - time < 1000) {
+    if (Date.now() - time < 1000) {
         scrollEnable = true;
     } else if (Math.abs(xDiff) > window.innerWidth / 3) {
         scrollEnable = true;
@@ -89,7 +146,9 @@ export const handleTouchEnd = (event: TouchEvent, app: App) => {
     const isXScroll = Math.abs(xDiff) > Math.abs(yDiff);
     const modelElement = hasClosestByAttribute(target, "id", "model", true);
     if (modelElement) {
-        if (isXScroll && firstDirection === "toRight" && !lastClientX && !hasClosestByClassName(target, "protyle-wysiwyg", true)) {
+        if (isXScroll && firstDirection === "toRight" && !lastClientX && !hasClosestByClassName(target, "protyle-wysiwyg", true) &&
+            // 划选文字时不触发关闭面板
+            (getSelection().rangeCount === 0 || getSelection().toString() === "")) {
             closeModel();
         }
         return;
@@ -157,22 +216,29 @@ export const handleTouchEnd = (event: TouchEvent, app: App) => {
 };
 
 export const handleTouchStart = (event: TouchEvent) => {
-    if (0 < event.touches.length && ((event.touches[0].target as HTMLElement).tagName === "VIDEO" || (event.touches[0].target as HTMLElement).tagName === "AUDIO")) {
+    time = Date.now();
+    const target = event.touches[0].target as HTMLElement;
+    if (0 < event.touches.length && (target.tagName === "VIDEO" || target.tagName === "AUDIO")) {
         // https://github.com/siyuan-note/siyuan/issues/14569
         activeBlur();
         return;
     }
-
-    if (globalTouchStart(event)) {
+    // 存在其他拖拽元素时
+    const otherTouchElement = hasClosestByClassName(target, "b3-chip");
+    if ((otherTouchElement && otherTouchElement.parentElement.classList.contains("b3-chips__doctag")) ||
+        target.closest(".protyle-gutters") ||
+        target.closest(".protyle-action") ||
+        target.closest(".av__gallery") ||
+        (target.tagName === "IMG" && target.style.cursor === "move" && target.parentElement.classList.contains("protyle-background__img"))) {
+        clientX = null;
+        clientY = null;
         return;
     }
-
-    if (getSelection().rangeCount > 0 && hasClosestBlock(event.target as Element)) {
-        const editor = getCurrentEditor();
-        if (editor && !editor.protyle.disabled && event.touches[0].clientY > window.innerHeight / 2 &&
-            document.querySelector("#keyboardToolbar").classList.contains("fn__none")) {
-            window.siyuan.mobile.touchRange = getRangeByPoint(event.touches[0].clientX, event.touches[0].clientY);
-        }
+    const editor = getCurrentEditor();
+    if (getSelection().rangeCount > 0 && hasClosestBlock(event.target as Element) &&
+        editor && !editor.protyle.disabled && event.touches[0].clientY > window.innerHeight / 2 &&
+        document.querySelector("#keyboardToolbar").classList.contains("fn__none")) {
+        window.siyuan.mobile.touchRange = getRangeByPoint(event.touches[0].clientX, event.touches[0].clientY);
     }
 
     firstDirection = null;
@@ -184,23 +250,39 @@ export const handleTouchStart = (event: TouchEvent) => {
         (event.touches[0].clientX > 8 && event.touches[0].clientX < window.innerWidth - 8)) {
         clientX = event.touches[0].clientX;
         clientY = event.touches[0].clientY;
-        time = new Date().getTime();
     } else {
         clientX = null;
         clientY = null;
-        time = 0;
         event.stopImmediatePropagation();
     }
     isFirstMove = true;
     scrollBlock = false;
+    // 长按编辑器内块达到阈值时直接进入多选模式，无需抬手
+    clearLongPress();
+    if (clientX && clientY && editor && !editor.protyle.toolbar.isMultiSelectMode()) {
+        const blockElement = hasClosestBlock(target);
+        if (blockElement && editor.protyle.wysiwyg.element.contains(blockElement)) {
+            longPressTimer = window.setTimeout(() => {
+                window.getSelection()?.removeAllRanges();
+                activeBlur();
+                editor.protyle.toolbar.showMultiSelectMode(editor.protyle, blockElement);
+            }, Constants.TIMEOUT_MULTIPLE_SELECT);
+        }
+    }
 };
 
 let previousClientX: number;
 const sideMaskElement = document.querySelector(".side-mask") as HTMLElement;
 export const handleTouchMove = (event: TouchEvent) => {
     const target = event.target as HTMLElement;
+    // 位移超过阈值说明是滑动而非长按，取消进入多选的定时器
+    if (clientX && clientY &&
+        (Math.abs(clientX - event.touches[0].clientX) >= 5 || Math.abs(clientY - event.touches[0].clientY) >= 5)) {
+        clearLongPress();
+    }
     if (!clientX || !clientY ||
         target.tagName === "AUDIO" ||
+        document.getElementById("dragGhost") ||
         hasClosestByClassName(target, "b3-dialog", true) ||
         (window.siyuan.mobile.editor && !window.siyuan.mobile.editor.protyle.toolbar.subElement.classList.contains("fn__none")) ||
         hasClosestByClassName(target, "keyboard") ||
@@ -218,7 +300,8 @@ export const handleTouchMove = (event: TouchEvent) => {
     if (getSelection().rangeCount > 0) {
         // 选中后扩选的情况
         const range = getSelection().getRangeAt(0);
-        if (range.toString() !== "" && window.siyuan.mobile.editor.protyle.wysiwyg.element.contains(range.startContainer)) {
+        const currentEditor = getCurrentEditor();
+        if (range.toString() !== "" && currentEditor?.protyle.wysiwyg.element.contains(range.startContainer)) {
             return;
         }
     }

@@ -19,6 +19,7 @@ package util
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/88250/gulu"
@@ -359,16 +360,16 @@ func PushSetDefRefCount(rootID, blockID string, defIDs []string, refCount, rootR
 	BroadcastByType("main", "setDefRefCount", 0, "", map[string]any{"rootID": rootID, "blockID": blockID, "refCount": refCount, "rootRefCount": rootRefCount, "defIDs": defIDs})
 }
 
-func PushLocalShorthandCount(count int) {
-	BroadcastByType("main", "setLocalShorthandCount", 0, "", map[string]any{"count": count})
-}
-
 func PushProtyleLoading(rootID, msg string) {
 	BroadcastByType("protyle", "addLoading", 0, msg, rootID)
 }
 
 func PushReloadEmojiConf() {
 	BroadcastByType("main", "reloadEmojiConf", 0, "", nil)
+}
+
+func PushKernelPluginState(name string, state int) {
+	BroadcastByType("main", "updateKernelPluginState", 0, "", map[string]any{"name": name, "state": state})
 }
 
 func PushDownloadProgress(id string, percent float32) {
@@ -547,4 +548,38 @@ func ClosePublishServiceSessions() {
 		session.CloseWithMsg([]byte("  close websocket: publish service closed"))
 		RemovePushChan(session)
 	}
+}
+
+var (
+	// lastActivityNs 记录最近一次用户写操作（前端发送 /api/transactions* 请求）的纳秒时间戳。
+	lastActivityNs atomic.Int64
+	// indexFixDirty 标记索引可能已脏（上次订正后用户又有新的写操作），需要再次订正。
+	indexFixDirty atomic.Bool
+)
+
+func init() {
+	// 初始化为启动时间，避免启动瞬间被判定为空闲
+	lastActivityNs.Store(time.Now().UnixNano())
+}
+
+// RefreshActivity 刷新用户最近活动时间，并标记索引可能已脏（需要订正）。
+// 在 model.Activity 中间件中，对 /api/transactions* 写操作请求调用。
+func RefreshActivity() {
+	lastActivityNs.Store(time.Now().UnixNano())
+	indexFixDirty.Store(true)
+}
+
+// MarkIndexClean 标记索引已订正完成，清除脏标志。订正流水线结束后调用。
+func MarkIndexClean() {
+	indexFixDirty.Store(false)
+}
+
+// IsIdle 自上次用户活动以来是否已超过 idleThreshold。
+func IsIdle(idleThreshold time.Duration) bool {
+	return time.Since(time.Unix(0, lastActivityNs.Load())) >= idleThreshold
+}
+
+// IsIndexFixDirty 返回是否存在未订正的变更（上次订正后有新用户活动）。
+func IsIndexFixDirty() bool {
+	return indexFixDirty.Load()
 }

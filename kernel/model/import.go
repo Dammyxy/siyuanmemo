@@ -963,6 +963,9 @@ func ImportFromLocalPath(boxID, localPath string, toPath string) (err error) {
 					dest = decodedDest
 				}
 				absolutePath := filepath.Join(currentDir, dest)
+				if !gulu.File.IsSubPath(currentDir, absolutePath) {
+					return ast.WalkContinue
+				}
 
 				if ast.NodeLinkDest == n.Type {
 					n.Tokens = []byte(dest)
@@ -1070,6 +1073,7 @@ func ImportFromLocalPath(boxID, localPath string, toPath string) (err error) {
 		tree.HPath = path.Join(baseHPath, title)
 		tree.Root.Spec = treenode.CurrentSpec
 
+		localPathParentDir := filepath.Dir(localPath)
 		docDirLocalPath := filepath.Dir(filepath.Join(boxLocalPath, targetPath))
 		assetDirPath := getAssetsDir(boxLocalPath, docDirLocalPath)
 		ast.Walk(tree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
@@ -1093,7 +1097,10 @@ func ImportFromLocalPath(boxID, localPath string, toPath string) (err error) {
 			if decodedDest != dest {
 				dest = decodedDest
 			}
-			absolutePath := filepath.Join(filepath.Dir(localPath), dest)
+			absolutePath := filepath.Join(localPathParentDir, dest)
+			if !gulu.File.IsSubPath(localPathParentDir, absolutePath) {
+				return ast.WalkContinue
+			}
 
 			if ast.NodeLinkDest == n.Type {
 				n.Tokens = []byte(dest)
@@ -1215,10 +1222,38 @@ func parseStdMd(markdown []byte) (ret *parse.Tree, yfmRootID, yfmTitle, yfmUpdat
 		return
 	}
 	yfmRootID, yfmTitle, yfmUpdated = normalizeTree(ret)
+	htmlBlock2Media(ret)
 	htmlBlock2Inline(ret)
 	parse.TextMarks2Inlines(ret) // 先将 TextMark 转换为 Inlines https://github.com/siyuan-note/siyuan/issues/13056
 	parse.NestedInlines2FlattedSpansHybrid(ret, false)
 	return
+}
+
+// htmlBlock2Media 将导入标准 Markdown 时被识别为 HTML 块的 <audio>/<video> 还原为音频/视频块。
+// 导入 Markdown 使用的是 NewStdLute，未启用 ProtyleWYSIWYG，故 lute 不会把 <audio>/<video> 解析为
+// NodeAudio/NodeVideo，而是兜底为 NodeHTMLBlock，这里在解析后做一次修正。
+// Improve Markdown import to parse audio/video tags https://github.com/siyuan-note/siyuan/issues/17985
+func htmlBlock2Media(tree *parse.Tree) {
+	ast.Walk(tree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
+		if !entering || ast.NodeHTMLBlock != n.Type {
+			return ast.WalkContinue
+		}
+
+		tokens := bytes.TrimSpace(n.Tokens)
+		tokens, _ = bytes.CutPrefix(tokens, []byte("<div>"))
+		tokens, _ = bytes.CutSuffix(tokens, []byte("</div>"))
+		tokens = bytes.TrimSpace(tokens)
+
+		lower := bytes.ToLower(tokens)
+		if bytes.HasPrefix(lower, []byte("<audio")) && bytes.HasSuffix(tokens, []byte(">")) {
+			n.Type = ast.NodeAudio
+			n.Tokens = tokens
+		} else if bytes.HasPrefix(lower, []byte("<video")) && bytes.HasSuffix(tokens, []byte(">")) {
+			n.Type = ast.NodeVideo
+			n.Tokens = tokens
+		}
+		return ast.WalkContinue
+	})
 }
 
 func processHTMLBlockSvgImg(n *ast.Node, assetDirPath string) {
@@ -1448,7 +1483,15 @@ func htmlBlock2Inline(tree *parse.Tree) {
 	for n, htmlA := range aHtmlBlocks {
 		href := domAttrValue(htmlA, "href")
 		title := domAttrValue(htmlA, "title")
-		anchor := util2.DomText(htmlA)
+		anchor := strings.TrimSpace(util2.DomText(htmlA))
+
+		if "" == anchor {
+			unlinks = append(unlinks, n)
+			if nil != n.Next && ast.NodeText == n.Next.Type && "</a>" == n.NextNodeText() {
+				unlinks = append(unlinks, n.Next)
+			}
+			continue
+		}
 
 		p := treenode.NewParagraph(n.ID)
 		a := &ast.Node{Type: ast.NodeLink}
