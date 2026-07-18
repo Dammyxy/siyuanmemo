@@ -957,11 +957,11 @@ func renderAttrView(blockID, avID, viewID, query string, page, pageSize int, gro
 	for _, v := range attrView.Views {
 		views = append(views, &av.ViewData{
 			ID:               v.ID,
-			Icon:              v.Icon,
-			Name:              v.Name,
-			Desc:              v.Desc,
+			Icon:             v.Icon,
+			Name:             v.Name,
+			Desc:             v.Desc,
 			HideAttrViewName: v.HideAttrViewName,
-			Type:              v.LayoutType,
+			Type:             v.LayoutType,
 			PageSize:         v.PageSize,
 		})
 	}
@@ -1045,7 +1045,7 @@ func setAttributeViewBlockAttr(c *gin.Context) {
 		// TODO 该参数将于 2026 年 12 月 1 日后删除
 		msg := fmt.Sprintf("[%s] parameter [%s] is deprecated, visit [https://github.com/siyuan-note/siyuan/issues/15727] for details",
 			c.Request.RequestURI, "rowID")
-		logging.LogWarnf(msg)
+		logging.LogWarn(msg)
 		ret.Code = -1
 		ret.Msg = msg
 		return
