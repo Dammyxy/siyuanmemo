@@ -145,3 +145,19 @@ Four webpack configs each emit a separate bundle to `app/stage/build/{app,deskto
 ## 7. Response style
 
 1. **Language:** Match the user's language; do not mix languages mid-sentence (keep proper nouns / identifiers in their original form)
+
+---
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked in GitHub Issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five canonical triage labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use the single-context domain documentation layout. See `docs/agents/domain.md`.
