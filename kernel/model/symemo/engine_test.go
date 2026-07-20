@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -56,6 +57,102 @@ func TestEngineDueItemReview(t *testing.T) {
 	}
 }
 
+func TestEngineItemQueueRejectsNonItemElements(t *testing.T) {
+	config := copyElementTreeFixtureWorkspace(t)
+	reviewPath := filepath.Join(config.ReviewsRoot(), "2026-07.smr")
+	reviewData, err := os.ReadFile(reviewPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture EventFile
+	if err = json.Unmarshal(reviewData, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	base := fixture.Events[0]
+	fixture.Events = nil
+	for i, elementID := range []string{treeTopicID, treeConceptID, treeInvalidID, treeFutureID} {
+		event := base
+		event.EventID = "non-item-introduction-" + elementID
+		event.OccurredAt = base.OccurredAt.Add(time.Duration(i) * time.Minute)
+		event.ElementID = elementID
+		event.Before.ElementID = elementID
+		event.After.ElementID = elementID
+		event.After.AdoptedTerminalID = event.EventID
+		fixture.Events = append(fixture.Events, event)
+	}
+	writeTestJSON(t, reviewPath, fixture)
+
+	engine, err := NewEngine(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+
+	due, err := engine.Query(t.Context(), Query{Kind: QueryElementSubset, Subset: "due"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due.Items) != 0 {
+		t.Fatalf("non-Items entered Item queue: %#v", due.Items)
+	}
+	started, err := engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionStart})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.Session == nil || started.Session.Status != SessionCompleted {
+		t.Fatalf("non-Items started an Item session: %#v", started.Session)
+	}
+	grade := 4
+	for _, elementID := range []string{treeTopicID, treeConceptID, treeInvalidID, treeFutureID} {
+		if _, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionGradeItem, ElementID: elementID, RawGrade: &grade, EventID: "non-item-grade-" + elementID}); !hasCode(err, ErrInvalidSessionPhase) {
+			t.Fatalf("direct non-Item grade error [%s] = %v", elementID, err)
+		}
+	}
+	after, err := config.LoadEventFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(fixture.Events) {
+		t.Fatalf("non-Item grading wrote an event: before=%d after=%d", len(fixture.Events), len(after))
+	}
+}
+
+func TestEngineItemQueueRejectsIncompatibleScheduleCapability(t *testing.T) {
+	config := copyFixtureWorkspace(t)
+	reviewPath := filepath.Join(config.ReviewsRoot(), "2026-07.smr")
+	reviewData, err := os.ReadFile(reviewPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reviewFile EventFile
+	if err = json.Unmarshal(reviewData, &reviewFile); err != nil {
+		t.Fatal(err)
+	}
+	reviewFile.Events[0].After.ScheduleProfile = "topic-afactor-v1"
+	reviewFile.Events[0].After.AcceptedReviewAction = "NextTopic"
+	writeTestJSON(t, reviewPath, reviewFile)
+
+	engine, err := NewEngine(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	due, err := engine.Query(t.Context(), Query{Kind: QueryElementSubset, Subset: "due"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due.Items) != 0 {
+		t.Fatalf("Item with incompatible schedule capability entered grading queue: %#v", due.Items)
+	}
+	started, err := engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionStart})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.Session == nil || started.Session.Status != SessionCompleted {
+		t.Fatalf("incompatible Item started a grading session: %#v", started.Session)
+	}
+}
+
 func TestEngineAllRawGrades(t *testing.T) {
 	for raw := 0; raw <= 5; raw++ {
 		t.Run(string(rune('0'+raw)), func(t *testing.T) {
@@ -75,6 +172,61 @@ func TestEngineAllRawGrades(t *testing.T) {
 				t.Fatalf("grade %d passed=%v", raw, result.Passed)
 			}
 		})
+	}
+}
+
+func TestReadOnlyEngineRejectsGradeBeforeStateMutation(t *testing.T) {
+	config := copyFixtureWorkspace(t)
+	config.ReadOnly = true
+	engine, err := NewEngine(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	if _, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionStart}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionShowAnswer, ElementID: fixtureElementID}); err != nil {
+		t.Fatal(err)
+	}
+	reviewPath := filepath.Join(config.ReviewsRoot(), "2026-07.smr")
+	beforeEvents, err := os.ReadFile(reviewPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSession, err := engine.Query(t.Context(), Query{Kind: QueryCurrentSession})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeProjection, err := engine.ledger.Snapshot(fixtureElementID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	grade := 4
+	if _, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionGradeItem, ElementID: fixtureElementID, RawGrade: &grade, EventID: "read-only-grade"}); !hasCode(err, ErrUnsupportedOperation) {
+		t.Fatalf("read-only grade error = %v", err)
+	}
+	afterEvents, err := os.ReadFile(reviewPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterSession, err := engine.Query(t.Context(), Query{Kind: QueryCurrentSession})
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterProjection, err := engine.ledger.Snapshot(fixtureElementID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterEvents) != string(beforeEvents) {
+		t.Fatal("read-only grade appended or rewrote review history")
+	}
+	if !reflect.DeepEqual(afterSession, beforeSession) {
+		t.Fatalf("read-only grade mutated session\nbefore=%#v\nafter=%#v", beforeSession, afterSession)
+	}
+	if !reflect.DeepEqual(afterProjection, beforeProjection) {
+		t.Fatalf("read-only grade mutated projection\nbefore=%#v\nafter=%#v", beforeProjection, afterProjection)
 	}
 }
 

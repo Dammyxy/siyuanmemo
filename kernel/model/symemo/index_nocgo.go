@@ -31,13 +31,14 @@ import (
 	"github.com/siyuan-note/filelock"
 )
 
-const projectionSchemaVersion = 2
+const projectionSchemaVersion = 3
 
 var errProjectionNotFound = errors.New("projection not found")
 
 type fileProjection struct {
 	SchemaVersion     int                             `json:"schemaVersion"`
 	Elements          map[string]Element              `json:"elements"`
+	Tree              []ElementTreeNode               `json:"tree"`
 	Projections       map[string]SchedulingProjection `json:"projections"`
 	Diagnostics       []EventDiagnostic               `json:"diagnostics"`
 	SourceDiagnostics []ElementSourceDiagnostic       `json:"sourceDiagnostics"`
@@ -73,31 +74,49 @@ func openProjectionIndex(path string) (*projectionIndex, error) {
 }
 
 func emptyFileProjection() fileProjection {
-	return fileProjection{SchemaVersion: projectionSchemaVersion, Elements: map[string]Element{}, Projections: map[string]SchedulingProjection{}}
+	return fileProjection{SchemaVersion: projectionSchemaVersion, Elements: map[string]Element{}, Tree: []ElementTreeNode{}, Projections: map[string]SchedulingProjection{}}
 }
 
 func (index *projectionIndex) replaceAll(_ context.Context, build projectionBuild) error {
 	index.mu.Lock()
 	defer index.mu.Unlock()
-	index.data = fileProjection{SchemaVersion: projectionSchemaVersion, Elements: build.Elements, Projections: build.Projections, Diagnostics: build.EventDiagnostics, SourceDiagnostics: build.SourceDiagnostics}
-	return index.saveLocked()
+	next := fileProjection{SchemaVersion: projectionSchemaVersion, Elements: build.Elements, Tree: build.Tree, Projections: build.Projections, Diagnostics: build.EventDiagnostics, SourceDiagnostics: build.SourceDiagnostics}
+	data, err := json.MarshalIndent(next, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err = index.saveDataLocked(data); err != nil {
+		return err
+	}
+	index.data = next
+	return nil
+}
+
+func (index *projectionIndex) tree() ([]ElementTreeNode, error) {
+	index.mu.RLock()
+	defer index.mu.RUnlock()
+	return append([]ElementTreeNode(nil), index.data.Tree...), nil
+}
+
+func (index *projectionIndex) saveDataLocked(data []byte) error {
+	if info, err := os.Stat(index.path); err == nil && info.IsDir() {
+		return errors.New("projection path is a directory")
+	}
+	return filelock.WriteFile(index.path, append(data, '\n'))
+}
+
+func (index *projectionIndex) saveLocked() error {
+	data, err := json.MarshalIndent(index.data, "", "  ")
+	if err != nil {
+		return err
+	}
+	return index.saveDataLocked(data)
 }
 
 func (index *projectionIndex) sourceDiagnostics() ([]ElementSourceDiagnostic, error) {
 	index.mu.RLock()
 	defer index.mu.RUnlock()
 	return append([]ElementSourceDiagnostic(nil), index.data.SourceDiagnostics...), nil
-}
-
-func (index *projectionIndex) saveLocked() error {
-	if info, err := os.Stat(index.path); err == nil && info.IsDir() {
-		return errors.New("projection path is a directory")
-	}
-	data, err := json.MarshalIndent(index.data, "", "  ")
-	if err != nil {
-		return err
-	}
-	return filelock.WriteFile(index.path, append(data, '\n'))
 }
 
 func (index *projectionIndex) projection(elementID string) (SchedulingProjection, error) {
@@ -126,7 +145,7 @@ func (index *projectionIndex) dueTargets(now time.Time, learningDate string) ([]
 	var targets []ReviewTarget
 	for id, projection := range index.data.Projections {
 		element, ok := index.data.Elements[id]
-		if !ok || projection.LifecycleState != "memorized" || projection.DueAt.After(now) || projection.LastLearningDate == learningDate {
+		if !ok || !isSchedulableItem(element, projection) || projection.LifecycleState != "memorized" || projection.DueAt.After(now) || projection.LastLearningDate == learningDate {
 			continue
 		}
 		targets = append(targets, ReviewTarget{Kind: "element.item", ElementID: id, Prompt: element.Payload.Prompt, DueAt: projection.DueAt, PriorityPosition: projection.PriorityPosition, ObservedBaseSchedulingEvent: projection.AdoptedTerminalID, ObservedProjection: projection, LearningDate: learningDate})

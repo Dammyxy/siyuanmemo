@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -226,13 +227,60 @@ func TestRebuildDiagnosesMissingElementSource(t *testing.T) {
 	}
 }
 
+func TestProjectionDeduplicatesSourceDiagnostics(t *testing.T) {
+	config := copyFixtureWorkspace(t)
+	rootID := "20260720020401-diagdup"
+	duplicateID := "20260720020402-baddupe"
+	blocked := Element{
+		Spec:            SupportedElementSpec,
+		ID:              duplicateID,
+		Type:            "topic",
+		Title:           "Duplicate blocked material",
+		ProcessingState: "reading",
+		PayloadSpec:     SupportedPayloadSpec,
+		Payload:         ElementPayload{Material: &TopicMaterial{Kind: "siyuanBlock", BlockID: "invalid"}},
+	}
+	root := Element{
+		Spec:            SupportedElementSpec,
+		ID:              rootID,
+		Type:            "topic",
+		Title:           "Diagnostic duplicates",
+		ProcessingState: "reading",
+		PayloadSpec:     SupportedPayloadSpec,
+		Payload:         ElementPayload{Material: &TopicMaterial{Kind: "html", HTML: "<p>root</p>"}},
+		Children:        []Element{blocked, blocked},
+	}
+	writeTestJSON(t, filepath.Join(config.ElementsRoot(), rootID+".sme"), root)
+	engine, err := NewEngine(t.Context(), config)
+	if err != nil {
+		t.Fatalf("complete projection publication failed on duplicate diagnostics: %v", err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	diagnostics, err := engine.index.sourceDiagnostics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, diagnostic := range diagnostics {
+		key := diagnostic.SourcePath + "\x00" + diagnostic.Code + "\x00" + diagnostic.ElementID
+		if seen[key] {
+			t.Fatalf("duplicate diagnostic key was published: %#v", diagnostic)
+		}
+		seen[key] = true
+	}
+	materialKey := rootID + ".sme\x00" + materialInvalidBlock + "\x00" + duplicateID
+	if !seen[materialKey] {
+		t.Fatalf("deduplicated material diagnostic missing: %#v", diagnostics)
+	}
+}
+
 func assertSourceDiagnostics(t *testing.T, actual []ElementSourceDiagnostic, expected map[string]ElementSourceDiagnostic) {
 	t.Helper()
 	if len(actual) != len(expected) {
 		t.Fatalf("source diagnostics = %#v", actual)
 	}
 	for _, diagnostic := range actual {
-		if want, ok := expected[diagnostic.SourcePath]; !ok || diagnostic != want {
+		if want, ok := expected[diagnostic.SourcePath]; !ok || !reflect.DeepEqual(diagnostic, want) {
 			t.Fatalf("source diagnostic = %#v, expected=%#v", diagnostic, want)
 		}
 	}

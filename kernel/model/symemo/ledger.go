@@ -108,7 +108,13 @@ func (ledger *SchedulingLedger) refreshLocked(ctx context.Context) error {
 	}
 	projections, diagnostics := projectSchedulingEvents(events)
 	sourceDiagnostics := sourceDiagnosticsWithMissingProjections(elementScan, projections)
-	return ledger.index.replaceAll(ctx, projectionBuild{Elements: elementScan.Elements, Projections: projections, EventDiagnostics: diagnostics, SourceDiagnostics: sourceDiagnostics})
+	effectiveConfig := ledger.config.LoadEffectiveSchedulerConfig()
+	if len(events) > 0 {
+		sourceDiagnostics = append(sourceDiagnostics, effectiveConfig.Diagnostics...)
+	}
+	sourceDiagnostics = normalizeSourceDiagnostics(sourceDiagnostics)
+	tree := buildElementTree(elementScan.Records, projections, true)
+	return ledger.index.replaceAll(ctx, projectionBuild{Elements: elementScan.Elements, Tree: tree, Projections: projections, EventDiagnostics: diagnostics, SourceDiagnostics: sourceDiagnostics})
 }
 
 func (ledger *SchedulingLedger) EventByID(eventID string) (SchedulingEvent, bool, error) {
@@ -148,7 +154,7 @@ func (ledger *SchedulingLedger) writeEventLocked(event SchedulingEvent) error {
 		return err
 	}
 	file := EventFile{Spec: SupportedEventSpec, Month: month}
-	if data, err := os.ReadFile(path); err == nil {
+	if data, err := filelock.ReadFile(path); err == nil {
 		if err = json.Unmarshal(data, &file); err != nil {
 			return err
 		}

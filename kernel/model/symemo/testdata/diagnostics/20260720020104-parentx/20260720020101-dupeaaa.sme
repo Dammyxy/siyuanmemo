@@ -1,0 +1,14 @@
+{
+  "spec": 1,
+  "id": "20260720020101-dupeaaa",
+  "type": "item",
+  "title": "Duplicate B",
+  "processingState": "processed",
+  "payloadSpec": 1,
+  "payload": {
+    "kind": "qa",
+    "prompt": "B?",
+    "answer": "B."
+  },
+  "children": []
+}

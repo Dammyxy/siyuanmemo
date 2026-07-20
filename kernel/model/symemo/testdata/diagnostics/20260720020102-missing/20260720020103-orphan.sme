@@ -1,0 +1,15 @@
+{
+  "spec": 1,
+  "id": "20260720020103-orphan",
+  "type": "topic",
+  "title": "Orphan Root",
+  "processingState": "reading",
+  "payloadSpec": 1,
+  "payload": {
+    "material": {
+      "kind": "html",
+      "html": "<p>Orphan</p>"
+    }
+  },
+  "children": []
+}

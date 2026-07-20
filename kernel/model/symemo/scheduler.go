@@ -37,6 +37,16 @@ func (scheduler *Scheduler) BuildQueue() ([]ReviewTarget, error) {
 	return scheduler.index.dueTargets(now, now.Format("2006-01-02"))
 }
 
+func isSchedulableItem(element Element, projection SchedulingProjection) bool {
+	if element.Type != "item" || element.Payload.Kind != "qa" || element.Payload.Prompt == "" || element.Payload.Answer == "" {
+		return false
+	}
+	if projection.ScheduleProfile != "" && projection.ScheduleProfile != fsrsV1ID {
+		return false
+	}
+	return projection.AcceptedReviewAction == "" || projection.AcceptedReviewAction == "GradeItem"
+}
+
 type scheduleApplyResult struct {
 	Projection      SchedulingProjection
 	Event           SchedulingEvent

@@ -1,0 +1,16 @@
+{
+  "spec": 1,
+  "id": "20260720010108-childrt",
+  "type": "topic",
+  "title": "Child Root Topic",
+  "processingState": "reading",
+  "payloadSpec": 1,
+  "payload": {
+    "material": {
+      "kind": "html",
+      "html": "<p>Child root material</p>"
+    }
+  },
+  "relations": [],
+  "children": []
+}

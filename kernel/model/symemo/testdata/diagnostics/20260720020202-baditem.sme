@@ -1,0 +1,14 @@
+{
+  "spec": 1,
+  "id": "20260720020202-baditem",
+  "type": "item",
+  "title": "Unsupported Payload",
+  "processingState": "processed",
+  "payloadSpec": 99,
+  "payload": {
+    "kind": "qa",
+    "prompt": "Unsupported?",
+    "answer": "Unsupported."
+  },
+  "children": []
+}

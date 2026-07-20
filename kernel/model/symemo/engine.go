@@ -35,24 +35,17 @@ func NewEngine(ctx context.Context, config Config) (*Engine, error) {
 	if config.StorageRoot == "" || config.IndexRoot == "" {
 		return nil, fmt.Errorf("symemo storage and index roots are required")
 	}
-	if err := config.ensureTracerSchedulerConfig(); err != nil {
-		return nil, fmt.Errorf("initialize scheduler config: %w", err)
-	}
 	index, err := openProjectionIndex(config.IndexPath())
 	if err != nil {
 		return nil, err
 	}
-	fsrsConfig, err := config.LoadTracerSchedulerConfig()
-	if err != nil {
-		index.close()
-		return nil, fmt.Errorf("load fsrs-v1 config: %w", err)
-	}
+	effectiveConfig := config.LoadEffectiveSchedulerConfig()
 	ledger := newSchedulingLedger(config, index)
 	if err = ledger.Refresh(ctx); err != nil {
 		index.close()
 		return nil, fmt.Errorf("initialize scheduling projection: %w", err)
 	}
-	scheduler := newScheduler(config, index, ledger, NewFSRSV1Adapter(fsrsConfig), NewSimpleV1Adapter())
+	scheduler := newScheduler(config, index, ledger, NewFSRSV1Adapter(effectiveConfig.FSRS), NewSimpleV1Adapter())
 	engine := &Engine{config: config, index: index, ledger: ledger, scheduler: scheduler}
 	engine.session = newLearningSession(config, scheduler, ledger)
 	return engine, nil
@@ -77,7 +70,7 @@ func (engine *Engine) SendToNote(context.Context, SendToNoteCommand) (SendToNote
 	return SendToNoteResult{}, domainError(ErrUnsupportedOperation, "SendToNote has no variants in item-learning-core", nil)
 }
 
-func (engine *Engine) Query(_ context.Context, query Query) (QueryResult, error) {
+func (engine *Engine) Query(ctx context.Context, query Query) (QueryResult, error) {
 	switch query.Kind {
 	case QueryElementSubset:
 		if query.Subset != "due" {
@@ -95,12 +88,30 @@ func (engine *Engine) Query(_ context.Context, query Query) (QueryResult, error)
 	case QueryCurrentSession:
 		state := engine.session.Current()
 		return QueryResult{Session: &state}, nil
+	case QueryElementTree:
+		nodes, err := engine.index.tree()
+		if err != nil {
+			return QueryResult{}, err
+		}
+		nodes = filterTreeRoot(nodes, query.RootElementID)
+		if query.RootElementID != "" && len(nodes) == 0 {
+			return QueryResult{}, domainError(ErrElementNotFound, "Element was not found", nil)
+		}
+		nodes = selectScheduleSummaries(nodes, query.IncludeScheduleSummary)
+		nodes, err = overlayBlockReferences(ctx, engine.config.BlockReader, nodes)
+		if err != nil {
+			return QueryResult{}, err
+		}
+		return QueryResult{Nodes: nodes}, nil
 	default:
 		return QueryResult{}, domainError(ErrUnsupportedOperation, "unsupported Query variant", nil)
 	}
 }
 
 func (engine *Engine) RunLearningAction(ctx context.Context, action LearningAction) (LearningResult, error) {
+	if engine.config.ReadOnly && isSchedulingChangingAction(action.Kind) {
+		return LearningResult{}, domainError(ErrUnsupportedOperation, "scheduling changes are unavailable in read-only mode", nil)
+	}
 	switch action.Kind {
 	case ActionStart:
 		state, err := engine.session.Start()
@@ -112,10 +123,17 @@ func (engine *Engine) RunLearningAction(ctx context.Context, action LearningActi
 		if action.RawGrade == nil {
 			return LearningResult{}, domainError(ErrUnsupportedGrade, "raw grade is required", nil)
 		}
+		if !engine.config.LoadEffectiveSchedulerConfig().PersistedComplete {
+			return LearningResult{}, domainError(ErrHistoryRequiresRepair, "scheduler configuration requires repair", nil)
+		}
 		return engine.session.Grade(ctx, action.ElementID, action.EventID, *action.RawGrade)
 	default:
 		return LearningResult{}, domainError(ErrUnsupportedOperation, "unsupported RunLearningAction variant", nil)
 	}
+}
+
+func isSchedulingChangingAction(kind LearningActionKind) bool {
+	return kind == ActionGradeItem
 }
 
 func (engine *Engine) Refresh(ctx context.Context) error { return engine.ledger.Refresh(ctx) }

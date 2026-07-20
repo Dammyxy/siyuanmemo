@@ -49,10 +49,12 @@ var symemoSafeMessages = map[string]string{
 	string(symemo.ErrProjectionRefreshFailed):      "The review was saved, but its schedule could not be refreshed.",
 	string(symemo.ErrQueueAdvanceFailed):           "The review was saved, but the learning queue could not advance.",
 	string(symemo.ErrHistoryRequiresRepair):        "The review history requires repair.",
+	string(symemo.ErrElementNotFound):              "The Element was not found.",
 }
 
 func registerSymemoRoutes(ginServer *gin.Engine) {
 	ginServer.Handle("POST", "/api/symemo/getElementSubset", model.CheckAuth, model.CheckAdminRole, getSymemoElementSubset)
+	ginServer.Handle("POST", "/api/symemo/getElementTree", model.CheckAuth, model.CheckAdminRole, getSymemoElementTree)
 	ginServer.Handle("POST", "/api/symemo/startLearning", model.CheckAuth, model.CheckAdminRole, startSymemoLearning)
 	ginServer.Handle("POST", "/api/symemo/showAnswer", model.CheckAuth, model.CheckAdminRole, showSymemoAnswer)
 	ginServer.Handle("POST", "/api/symemo/gradeItem", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, gradeSymemoItem)
@@ -65,6 +67,11 @@ type symemoSubsetRequest struct {
 
 type symemoElementRequest struct {
 	ElementID string `json:"elementId" binding:"required"`
+}
+
+type symemoElementTreeRequest struct {
+	RootElementID          string `json:"rootElementId"`
+	IncludeScheduleSummary bool   `json:"includeScheduleSummary"`
 }
 
 type symemoGradeRequest struct {
@@ -84,6 +91,24 @@ func getSymemoElementSubset(c *gin.Context) {
 		return
 	}
 	result, err := engine.Query(c, symemo.Query{Kind: symemo.QueryElementSubset, Subset: request.Subset})
+	if err != nil {
+		writeSymemoError(c, err)
+		return
+	}
+	writeSymemoSuccess(c, result)
+}
+
+func getSymemoElementTree(c *gin.Context) {
+	var request symemoElementTreeRequest
+	if !bindSymemoRequest(c, &request) {
+		return
+	}
+	engine, err := model.GetSymemoEngine()
+	if err != nil {
+		writeSymemoError(c, err)
+		return
+	}
+	result, err := engine.Query(c, symemo.Query{Kind: symemo.QueryElementTree, RootElementID: request.RootElementID, IncludeScheduleSummary: request.IncludeScheduleSummary})
 	if err != nil {
 		writeSymemoError(c, err)
 		return

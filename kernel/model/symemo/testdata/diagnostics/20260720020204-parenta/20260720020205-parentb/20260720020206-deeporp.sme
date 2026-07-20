@@ -1,0 +1,15 @@
+{
+  "spec": 1,
+  "id": "20260720020206-deeporp",
+  "type": "topic",
+  "title": "Deep Orphan Root",
+  "processingState": "reading",
+  "payloadSpec": 1,
+  "payload": {
+    "material": {
+      "kind": "html",
+      "html": "<p>Deep orphan</p>"
+    }
+  },
+  "children": []
+}

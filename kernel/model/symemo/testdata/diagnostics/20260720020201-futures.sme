@@ -1,0 +1,15 @@
+{
+  "spec": 99,
+  "id": "20260720020201-futures",
+  "type": "topic",
+  "title": "Unsupported Source Spec",
+  "processingState": "reading",
+  "payloadSpec": 1,
+  "payload": {
+    "material": {
+      "kind": "html",
+      "html": "<p>Unsupported source spec</p>"
+    }
+  },
+  "children": []
+}

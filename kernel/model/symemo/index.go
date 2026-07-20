@@ -34,7 +34,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-const projectionSchemaVersion = 2
+const projectionSchemaVersion = 3
 
 var errProjectionNotFound = errors.New("projection not found")
 
@@ -91,9 +91,10 @@ func (index *projectionIndex) openFresh() error {
 	statements := []string{
 		"CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 		"CREATE TABLE elements (id TEXT PRIMARY KEY, source_json BLOB NOT NULL)",
+		"CREATE TABLE tree (key TEXT PRIMARY KEY, tree_json BLOB NOT NULL)",
 		"CREATE TABLE projections (element_id TEXT PRIMARY KEY, projection_json BLOB NOT NULL)",
 		"CREATE TABLE diagnostics (event_id TEXT NOT NULL, payload_hash TEXT NOT NULL, diagnostic_json BLOB NOT NULL, PRIMARY KEY(event_id, payload_hash))",
-		"CREATE TABLE source_diagnostics (source_path TEXT PRIMARY KEY, diagnostic_json BLOB NOT NULL)",
+		"CREATE TABLE source_diagnostics (source_path TEXT NOT NULL, code TEXT NOT NULL, element_id TEXT NOT NULL, diagnostic_json BLOB NOT NULL, PRIMARY KEY(source_path, code, element_id))",
 		"INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
 	}
 	for i, statement := range statements {
@@ -120,7 +121,7 @@ func (index *projectionIndex) replaceAll(ctx context.Context, build projectionBu
 		return err
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"elements", "projections", "diagnostics", "source_diagnostics"} {
+	for _, table := range []string{"elements", "tree", "projections", "diagnostics", "source_diagnostics"} {
 		if _, err = tx.Exec("DELETE FROM " + table); err != nil {
 			return err
 		}
@@ -138,6 +139,13 @@ func (index *projectionIndex) replaceAll(ctx context.Context, build projectionBu
 		if _, err = tx.Exec("INSERT INTO elements(id, source_json) VALUES(?, ?)", id, data); err != nil {
 			return err
 		}
+	}
+	treeData, err := json.Marshal(build.Tree)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec("INSERT INTO tree(key, tree_json) VALUES('default', ?)", treeData); err != nil {
+		return err
 	}
 	projectionIDs := make([]string, 0, len(build.Projections))
 	for id := range build.Projections {
@@ -167,7 +175,7 @@ func (index *projectionIndex) replaceAll(ctx context.Context, build projectionBu
 		if marshalErr != nil {
 			return marshalErr
 		}
-		if _, err = tx.Exec("INSERT INTO source_diagnostics(source_path, diagnostic_json) VALUES(?, ?)", diagnostic.SourcePath, data); err != nil {
+		if _, err = tx.Exec("INSERT INTO source_diagnostics(source_path, code, element_id, diagnostic_json) VALUES(?, ?, ?, ?)", diagnostic.SourcePath, diagnostic.Code, diagnostic.ElementID, data); err != nil {
 			return err
 		}
 	}
@@ -177,7 +185,7 @@ func (index *projectionIndex) replaceAll(ctx context.Context, build projectionBu
 func (index *projectionIndex) sourceDiagnostics() ([]ElementSourceDiagnostic, error) {
 	index.mu.RLock()
 	defer index.mu.RUnlock()
-	rows, err := index.db.Query("SELECT diagnostic_json FROM source_diagnostics ORDER BY source_path")
+	rows, err := index.db.Query("SELECT diagnostic_json FROM source_diagnostics ORDER BY source_path, code, element_id")
 	if err != nil {
 		return nil, err
 	}
@@ -195,6 +203,23 @@ func (index *projectionIndex) sourceDiagnostics() ([]ElementSourceDiagnostic, er
 		diagnostics = append(diagnostics, diagnostic)
 	}
 	return diagnostics, rows.Err()
+}
+
+func (index *projectionIndex) tree() ([]ElementTreeNode, error) {
+	index.mu.RLock()
+	defer index.mu.RUnlock()
+	var data []byte
+	if err := index.db.QueryRow("SELECT tree_json FROM tree WHERE key = 'default'").Scan(&data); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errProjectionNotFound
+		}
+		return nil, err
+	}
+	var nodes []ElementTreeNode
+	if err := json.Unmarshal(data, &nodes); err != nil {
+		return nil, err
+	}
+	return nodes, nil
 }
 
 func (index *projectionIndex) projection(elementID string) (SchedulingProjection, error) {
@@ -253,7 +278,7 @@ func (index *projectionIndex) dueTargets(now time.Time, learningDate string) ([]
 		if err = json.Unmarshal(projectionData, &projection); err != nil {
 			return nil, err
 		}
-		if projection.LifecycleState != "memorized" || projection.DueAt.After(now) || projection.LastLearningDate == learningDate {
+		if !isSchedulableItem(element, projection) || projection.LifecycleState != "memorized" || projection.DueAt.After(now) || projection.LastLearningDate == learningDate {
 			continue
 		}
 		targets = append(targets, ReviewTarget{

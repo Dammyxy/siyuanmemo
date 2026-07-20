@@ -16,7 +16,10 @@
 
 package symemo
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 const (
 	SupportedElementSpec = 1
@@ -32,20 +35,160 @@ type Element struct {
 	Title           string         `json:"title,omitempty"`
 	ProcessingState string         `json:"processingState"`
 	PayloadSpec     int            `json:"payloadSpec"`
-	Payload         ItemPayload    `json:"payload"`
+	Payload         ElementPayload `json:"payload"`
 	Relations       []Relation     `json:"relations,omitempty"`
-	Children        []ChildElement `json:"children,omitempty"`
+	Children        []Element      `json:"children,omitempty"`
 }
 
-type ItemPayload struct {
-	Kind   string `json:"kind"`
-	Prompt string `json:"prompt"`
-	Answer string `json:"answer"`
+func (element Element) MarshalJSON() ([]byte, error) {
+	type elementAlias Element
+	payload := element.Payload.Raw
+	if isSupportedElementType(element.Type) || len(payload) == 0 {
+		var err error
+		payload, err = json.Marshal(element.Payload)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return json.Marshal(struct {
+		elementAlias
+		Payload json.RawMessage `json:"payload"`
+	}{elementAlias: elementAlias(element), Payload: payload})
 }
 
-type ChildElement struct {
-	ID   string `json:"id"`
-	Type string `json:"type"`
+func isSupportedElementType(elementType string) bool {
+	switch elementType {
+	case "item", "topic", "concept":
+		return true
+	default:
+		return false
+	}
+}
+
+type ElementPayload struct {
+	Kind     string          `json:"kind,omitempty"`
+	Prompt   string          `json:"prompt,omitempty"`
+	Answer   string          `json:"answer,omitempty"`
+	Material *TopicMaterial  `json:"material,omitempty"`
+	Raw      json.RawMessage `json:"-"`
+}
+
+type ItemPayload = ElementPayload
+
+func (payload *ElementPayload) UnmarshalJSON(data []byte) error {
+	type payloadAlias ElementPayload
+	var decoded payloadAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*payload = ElementPayload(decoded)
+	payload.Raw = append(payload.Raw[:0], data...)
+	return nil
+}
+
+func (payload ElementPayload) MarshalJSON() ([]byte, error) {
+	if payload.Kind == "" && payload.Prompt == "" && payload.Answer == "" && payload.Material == nil && len(payload.Raw) > 0 {
+		return payload.Raw, nil
+	}
+	type payloadAlias ElementPayload
+	return json.Marshal(payloadAlias(payload))
+}
+
+type TopicMaterial struct {
+	Kind             string          `json:"kind"`
+	HTML             string          `json:"html,omitempty"`
+	BlockID          string          `json:"blockId,omitempty"`
+	SourceNotebookID string          `json:"sourceNotebookId,omitempty"`
+	Raw              json.RawMessage `json:"-"`
+}
+
+func (material *TopicMaterial) UnmarshalJSON(data []byte) error {
+	type materialAlias TopicMaterial
+	var decoded materialAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*material = TopicMaterial(decoded)
+	material.Raw = append(material.Raw[:0], data...)
+	return nil
+}
+
+func (material TopicMaterial) MarshalJSON() ([]byte, error) {
+	if !isSupportedTopicMaterialKind(material.Kind) && len(material.Raw) > 0 {
+		return material.Raw, nil
+	}
+	type materialAlias TopicMaterial
+	return json.Marshal(materialAlias(material))
+}
+
+func isSupportedTopicMaterialKind(kind string) bool {
+	return kind == "html" || kind == "siyuanBlock"
+}
+
+type StorageKind string
+
+const (
+	StorageKindInternal     StorageKind = "internal"
+	StorageKindRootDocument StorageKind = "rootDocument"
+)
+
+type SourceMode string
+
+const (
+	SourceModeHTML    SourceMode = "html"
+	SourceModeBlock   SourceMode = "block"
+	SourceModeOpaque  SourceMode = "opaque"
+	SourceModeUnknown SourceMode = "unknown"
+)
+
+type SupportStatus string
+
+const (
+	SupportStatusSupported           SupportStatus = "supported"
+	SupportStatusUnsupportedReadOnly SupportStatus = "unsupportedReadOnly"
+)
+
+type MaterialSourceStatus string
+
+const (
+	MaterialSourceAvailable   MaterialSourceStatus = "available"
+	MaterialSourceUnavailable MaterialSourceStatus = "unavailable"
+	MaterialSourceUnresolved  MaterialSourceStatus = "unresolved"
+)
+
+type ElementMaterialDiagnostic struct {
+	Code   string `json:"code"`
+	Reason string `json:"reason"`
+}
+
+type ElementTreeNode struct {
+	ElementID                string                     `json:"elementId"`
+	Type                     string                     `json:"type"`
+	Title                    string                     `json:"title,omitempty"`
+	ProcessingState          string                     `json:"processingState,omitempty"`
+	ParentElementID          string                     `json:"parentElementId,omitempty"`
+	RootElementID            string                     `json:"rootElementId"`
+	StorageKind              StorageKind                `json:"storageKind"`
+	SourcePath               string                     `json:"sourcePath"`
+	SortRank                 *int                       `json:"sortRank,omitempty"`
+	SourceMode               SourceMode                 `json:"sourceMode"`
+	SupportStatus            SupportStatus              `json:"supportStatus"`
+	BlockID                  string                     `json:"blockId,omitempty"`
+	SourceNotebookID         string                     `json:"sourceNotebookId,omitempty"`
+	CurrentNotebookID        string                     `json:"currentNotebookId,omitempty"`
+	CurrentPath              string                     `json:"currentPath,omitempty"`
+	MaterialSourceStatus     *MaterialSourceStatus      `json:"materialSourceStatus,omitempty"`
+	MaterialSourceDiagnostic *ElementMaterialDiagnostic `json:"materialSourceDiagnostic,omitempty"`
+	ScheduleSummary          *ElementScheduleSummary    `json:"scheduleSummary,omitempty"`
+	Children                 []ElementTreeNode          `json:"children,omitempty"`
+}
+
+type ElementScheduleSummary struct {
+	ScheduleProfile      string     `json:"scheduleProfile"`
+	AcceptedReviewAction string     `json:"acceptedReviewAction,omitempty"`
+	LifecycleState       string     `json:"lifecycleState,omitempty"`
+	DueAt                *time.Time `json:"dueAt,omitempty"`
+	PriorityPosition     *float64   `json:"priorityPosition,omitempty"`
 }
 
 type Relation struct {
@@ -150,20 +293,22 @@ type AlgorithmDecision struct {
 }
 
 type SchedulingProjection struct {
-	ElementID         string                             `json:"elementId"`
-	LifecycleState    string                             `json:"lifecycleState"`
-	AdoptedTerminalID string                             `json:"adoptedTerminalEventId,omitempty"`
-	DueAt             time.Time                          `json:"dueAt"`
-	IntervalDays      int                                `json:"intervalDays"`
-	Repetitions       int                                `json:"repetitions"`
-	Lapses            int                                `json:"lapses"`
-	LastReviewAt      *time.Time                         `json:"lastReviewAt,omitempty"`
-	LastLearningDate  string                             `json:"lastLearningDate,omitempty"`
-	LastRawGrade      *int                               `json:"lastRawGrade,omitempty"`
-	LastPassed        *bool                              `json:"lastPassed,omitempty"`
-	ActiveAlgorithm   string                             `json:"activeAlgorithm,omitempty"`
-	AlgorithmStates   map[string]VersionedAlgorithmState `json:"algorithmStates,omitempty"`
-	PriorityPosition  float64                            `json:"priorityPosition"`
+	ElementID            string                             `json:"elementId"`
+	ScheduleProfile      string                             `json:"scheduleProfile,omitempty"`
+	AcceptedReviewAction string                             `json:"acceptedReviewAction,omitempty"`
+	LifecycleState       string                             `json:"lifecycleState"`
+	AdoptedTerminalID    string                             `json:"adoptedTerminalEventId,omitempty"`
+	DueAt                time.Time                          `json:"dueAt"`
+	IntervalDays         int                                `json:"intervalDays"`
+	Repetitions          int                                `json:"repetitions"`
+	Lapses               int                                `json:"lapses"`
+	LastReviewAt         *time.Time                         `json:"lastReviewAt,omitempty"`
+	LastLearningDate     string                             `json:"lastLearningDate,omitempty"`
+	LastRawGrade         *int                               `json:"lastRawGrade,omitempty"`
+	LastPassed           *bool                              `json:"lastPassed,omitempty"`
+	ActiveAlgorithm      string                             `json:"activeAlgorithm,omitempty"`
+	AlgorithmStates      map[string]VersionedAlgorithmState `json:"algorithmStates,omitempty"`
+	PriorityPosition     float64                            `json:"priorityPosition"`
 }
 
 type SchedulingEvent struct {
@@ -201,14 +346,16 @@ type EventDiagnostic struct {
 }
 
 type ElementSourceDiagnostic struct {
-	SourcePath string `json:"sourcePath"`
-	ElementID  string `json:"elementId,omitempty"`
-	Code       string `json:"code"`
-	Reason     string `json:"reason"`
+	SourcePath   string   `json:"sourcePath"`
+	ElementID    string   `json:"elementId,omitempty"`
+	Code         string   `json:"code"`
+	Reason       string   `json:"reason"`
+	RelatedPaths []string `json:"relatedPaths,omitempty"`
 }
 
 type projectionBuild struct {
 	Elements          map[string]Element
+	Tree              []ElementTreeNode
 	Projections       map[string]SchedulingProjection
 	EventDiagnostics  []EventDiagnostic
 	SourceDiagnostics []ElementSourceDiagnostic
@@ -234,17 +381,21 @@ type QueryKind string
 const (
 	QueryElementSubset  QueryKind = "GetElementSubset"
 	QueryCurrentSession QueryKind = "GetCurrentLearningSession"
+	QueryElementTree    QueryKind = "GetElementTree"
 )
 
 type Query struct {
-	Kind   QueryKind `json:"kind"`
-	Subset string    `json:"subset,omitempty"`
+	Kind                   QueryKind `json:"kind"`
+	Subset                 string    `json:"subset,omitempty"`
+	RootElementID          string    `json:"rootElementId,omitempty"`
+	IncludeScheduleSummary bool      `json:"includeScheduleSummary,omitempty"`
 }
 
 type QueryResult struct {
 	Subset  string                `json:"subset,omitempty"`
 	Items   []ReviewTargetSummary `json:"items,omitempty"`
 	Session *SessionState         `json:"session,omitempty"`
+	Nodes   []ElementTreeNode     `json:"nodes,omitempty"`
 }
 
 type LearningResult struct {

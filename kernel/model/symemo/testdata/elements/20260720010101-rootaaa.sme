@@ -1,0 +1,144 @@
+{
+  "spec": 1,
+  "id": "20260720010101-rootaaa",
+  "type": "topic",
+  "title": "Root Topic",
+  "processingState": "reading",
+  "payloadSpec": 1,
+  "payload": {
+    "material": {
+      "kind": "html",
+      "html": "<p>Root material</p>"
+    }
+  },
+  "relations": [],
+  "children": [
+    {
+      "spec": 1,
+      "id": "20260720010102-itemaaa",
+      "type": "item",
+      "title": "Nested Item",
+      "processingState": "processed",
+      "payloadSpec": 1,
+      "payload": {
+        "kind": "qa",
+        "prompt": "Nested prompt?",
+        "answer": "Nested answer."
+      },
+      "relations": [],
+      "children": []
+    },
+    {
+      "spec": 1,
+      "id": "20260720010103-topicaa",
+      "type": "topic",
+      "title": "Nested HTML Topic",
+      "processingState": "reading",
+      "payloadSpec": 1,
+      "payload": {
+        "material": {
+          "kind": "html",
+          "html": "<p>Nested material</p>"
+        }
+      },
+      "relations": [],
+      "children": []
+    },
+    {
+      "spec": 1,
+      "id": "20260720010104-blockaa",
+      "type": "topic",
+      "title": "Block-backed Topic",
+      "processingState": "reading",
+      "payloadSpec": 1,
+      "payload": {
+        "material": {
+          "kind": "siyuanBlock",
+          "blockId": "20260720123000-blockok",
+          "sourceNotebookId": "20260720000000-sourceb"
+        }
+      },
+      "relations": [],
+      "children": []
+    },
+    {
+      "spec": 1,
+      "id": "20260720010109-missblk",
+      "type": "topic",
+      "title": "Missed Block-backed Topic",
+      "processingState": "reading",
+      "payloadSpec": 1,
+      "payload": {
+        "material": {
+          "kind": "siyuanBlock",
+          "blockId": "20260720123001-missblk",
+          "sourceNotebookId": "20260720000000-sourceb"
+        }
+      },
+      "relations": [],
+      "children": []
+    },
+    {
+      "spec": 1,
+      "id": "20260720010105-badblok",
+      "type": "topic",
+      "title": "Invalid Block Reference",
+      "processingState": "reading",
+      "payloadSpec": 1,
+      "payload": {
+        "material": {
+          "kind": "siyuanBlock",
+          "blockId": "not-a-block",
+          "sourceNotebookId": "20260720000000-sourceb"
+        }
+      },
+      "relations": [],
+      "children": []
+    },
+    {
+      "spec": 1,
+      "id": "20260720010110-encrypt",
+      "type": "topic",
+      "title": "Encrypted Block Reference",
+      "processingState": "reading",
+      "payloadSpec": 1,
+      "payload": {
+        "material": {
+          "kind": "siyuanBlock",
+          "blockId": "20260720123002-encrypt",
+          "sourceNotebookId": "20260720000000-sourceb"
+        }
+      },
+      "relations": [],
+      "children": []
+    },
+    {
+      "spec": 1,
+      "id": "20260720010106-futurex",
+      "type": "futureKind",
+      "title": "Future Element",
+      "processingState": "new",
+      "payloadSpec": 7,
+      "payload": {
+        "opaque": {
+          "kept": true
+        }
+      },
+      "relations": [],
+      "children": []
+    },
+    {
+      "spec": 1,
+      "id": "20260720010107-concept",
+      "type": "concept",
+      "title": "Concept",
+      "processingState": "processed",
+      "payloadSpec": 1,
+      "payload": {
+        "defaults": {}
+      },
+      "relations": [],
+      "children": []
+    }
+  ]
+}

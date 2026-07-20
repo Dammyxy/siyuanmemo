@@ -19,6 +19,8 @@ package symemo
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -98,7 +100,68 @@ func TestStorageRejectsUnsupportedReviewAndSchedulerSchemas(t *testing.T) {
 	})
 }
 
-func TestEngineInitializesMissingSchedulerDefaults(t *testing.T) {
+func TestEngineUsesInMemorySchedulerDefaultsWithoutWriting(t *testing.T) {
+	config := copyFixtureWorkspace(t)
+	if err := os.RemoveAll(config.SchedulerRoot); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotPaths(t, config.StorageRoot)
+	engine, err := NewEngine(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	loaded := config.LoadEffectiveSchedulerConfig()
+	if loaded.FSRS.Algorithm != fsrsV1ID || loaded.FSRS.RequestRetention != 0.9 || loaded.FSRS.MaximumIntervalDays != 36500 || len(loaded.FSRS.Weights) != 19 || !loaded.FSRS.EnableShortTerm || loaded.FSRS.EnableFuzz {
+		t.Fatalf("effective scheduler defaults = %#v", loaded.FSRS)
+	}
+	if _, err = os.Stat(config.SchedulerRoot); !os.IsNotExist(err) {
+		t.Fatalf("scheduler directory was created by Engine: %v", err)
+	}
+	if after := snapshotPaths(t, config.StorageRoot); !equalStringMaps(before, after) {
+		t.Fatalf("Engine changed authoritative source paths\nbefore=%#v\nafter=%#v", before, after)
+	}
+	diagnostics, err := engine.index.sourceDiagnostics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundMissing := false
+	for _, diagnostic := range diagnostics {
+		foundMissing = foundMissing || diagnostic.Code == "missing-scheduler-config"
+	}
+	if !foundMissing {
+		t.Fatalf("workspace with review history omitted scheduler authority loss: %#v", diagnostics)
+	}
+}
+
+func TestCleanWorkspaceDoesNotReportMissingSchedulerConfig(t *testing.T) {
+	config := copyFixtureWorkspace(t)
+	if err := os.RemoveAll(config.SchedulerRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(config.ReviewsRoot()); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	diagnostics, err := engine.index.sourceDiagnostics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Code == "missing-scheduler-config" {
+			t.Fatalf("clean workspace reported scheduler authority loss: %#v", diagnostics)
+		}
+	}
+	if _, err = os.Stat(config.SchedulerRoot); !os.IsNotExist(err) {
+		t.Fatalf("clean Engine open created scheduler authority: %v", err)
+	}
+}
+
+func TestSchedulingWriteRequiresPersistedSchedulerConfig(t *testing.T) {
 	config := copyFixtureWorkspace(t)
 	if err := os.RemoveAll(config.SchedulerRoot); err != nil {
 		t.Fatal(err)
@@ -108,28 +171,70 @@ func TestEngineInitializesMissingSchedulerDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer engine.Close()
-	loaded, err := config.LoadTracerSchedulerConfig()
-	if err != nil {
+	if _, err = engine.RunLearningAction(context.Background(), LearningAction{Kind: ActionStart}); err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Algorithm != fsrsV1ID || loaded.RequestRetention != 0.9 || loaded.MaximumIntervalDays != 36500 || len(loaded.Weights) != 19 || !loaded.EnableShortTerm || loaded.EnableFuzz {
-		t.Fatalf("generated scheduler defaults = %#v", loaded)
+	if _, err = engine.RunLearningAction(context.Background(), LearningAction{Kind: ActionShowAnswer, ElementID: fixtureElementID}); err != nil {
+		t.Fatal(err)
 	}
-	for _, name := range []string{"collection.json", "simple-v1.json", "fsrs-v1.json", "arena-v1.json"} {
-		if _, err = os.Stat(filepath.Join(config.SchedulerRoot, name)); err != nil {
-			t.Fatalf("missing generated scheduler config %s: %v", name, err)
-		}
+	before := snapshotPaths(t, config.StorageRoot)
+	grade := 4
+	_, err = engine.RunLearningAction(context.Background(), LearningAction{Kind: ActionGradeItem, ElementID: fixtureElementID, RawGrade: &grade, EventID: "missing-scheduler-config-grade"})
+	if !hasCode(err, ErrHistoryRequiresRepair) {
+		t.Fatalf("missing scheduler grade error = %v", err)
+	}
+	if _, statErr := os.Stat(config.SchedulerRoot); !os.IsNotExist(statErr) {
+		t.Fatalf("scheduler directory was created by grade: %v", statErr)
+	}
+	if after := snapshotPaths(t, config.StorageRoot); !equalStringMaps(before, after) {
+		t.Fatalf("blocked grade changed authoritative source paths\nbefore=%#v\nafter=%#v", before, after)
 	}
 }
 
-func TestSchedulerDefaultsDoNotOverwriteExistingConfig(t *testing.T) {
+func TestSchedulerSemanticDiagnosticsIdentifyOwningFile(t *testing.T) {
+	tests := []struct {
+		name       string
+		configName string
+		config     SchedulerConfig
+		wantPath   string
+	}{
+		{name: "simple algorithm", configName: "simple-v1", config: SchedulerConfig{Spec: 1, Algorithm: "wrong", IntervalRule: "item-simple-v1"}, wantPath: "scheduler/simple-v1.json"},
+		{name: "arena algorithms", configName: "arena-v1", config: SchedulerConfig{Spec: 1, Primary: "wrong", EnabledAlgorithms: []string{fsrsV1ID, simpleV1ID}, Fallback: simpleV1ID}, wantPath: "scheduler/arena-v1.json"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := copyFixtureWorkspace(t)
+			writeTestJSON(t, filepath.Join(config.SchedulerRoot, test.configName+".json"), test.config)
+			engine, err := NewEngine(t.Context(), config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = engine.Close() })
+			diagnostics, err := engine.index.sourceDiagnostics()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var invalid []ElementSourceDiagnostic
+			for _, diagnostic := range diagnostics {
+				if diagnostic.Code == "invalid-scheduler-config" {
+					invalid = append(invalid, diagnostic)
+				}
+			}
+			if len(invalid) != 1 || invalid[0].SourcePath != test.wantPath {
+				t.Fatalf("semantic diagnostics = %#v, want owning path %s", invalid, test.wantPath)
+			}
+		})
+	}
+}
+
+func TestBootstrapSchedulerConfigMissingOnlyAndReadOnlyBypass(t *testing.T) {
 	config := copyFixtureWorkspace(t)
 	path := filepath.Join(config.SchedulerRoot, "collection.json")
 	before, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = config.ensureTracerSchedulerConfig(); err != nil {
+	if err = config.BootstrapSchedulerConfig(); err != nil {
 		t.Fatal(err)
 	}
 	after, err := os.ReadFile(path)
@@ -139,6 +244,59 @@ func TestSchedulerDefaultsDoNotOverwriteExistingConfig(t *testing.T) {
 	if string(before) != string(after) {
 		t.Fatal("existing scheduler config was overwritten")
 	}
+	readOnly := config
+	readOnly.ReadOnly = true
+	missing := filepath.Join(readOnly.SchedulerRoot, "topic-afactor-v1.json")
+	if err = readOnly.BootstrapSchedulerConfig(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("read-only bootstrap created optional config: %v", err)
+	}
+}
+
+func snapshotPaths(t *testing.T, root string) map[string]string {
+	t.Helper()
+	paths := map[string]string{}
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		return paths
+	}
+	if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() && entry.Name() == "temp" {
+			return fs.SkipDir
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		paths[filepath.ToSlash(relative)] = string(data)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return paths
+}
+
+func equalStringMaps(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if right[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func writeTestJSON(t *testing.T, path string, value any) {

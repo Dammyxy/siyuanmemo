@@ -21,6 +21,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -38,6 +40,12 @@ func copyFixtureWorkspace(t *testing.T) Config {
 		relative, err := filepath.Rel(source, path)
 		if err != nil {
 			return err
+		}
+		if skipBaselineFixturePath(relative) {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		target := filepath.Join(root, relative)
 		if entry.IsDir() {
@@ -65,6 +73,24 @@ func copyFixtureWorkspace(t *testing.T) Config {
 	}
 }
 
+func skipBaselineFixturePath(relative string) bool {
+	relative = filepath.ToSlash(relative)
+	if relative == "." || relative == "elements" {
+		return false
+	}
+	if !strings.HasPrefix(relative, "elements/") {
+		return false
+	}
+	return relative != "elements/"+fixtureElementID+".sme"
+}
+
+func copyElementTreeFixtureWorkspace(t *testing.T) Config {
+	t.Helper()
+	config := copyFixtureWorkspace(t)
+	copyTestTree(t, filepath.Join("testdata", "elements"), config.ElementsRoot())
+	return config
+}
+
 func newFixtureEngine(t *testing.T) (*Engine, Config) {
 	t.Helper()
 	config := copyFixtureWorkspace(t)
@@ -86,4 +112,42 @@ func newFixtureEngine(t *testing.T) (*Engine, Config) {
 	}
 	t.Cleanup(func() { _ = engine.Close() })
 	return engine, config
+}
+
+type fakeBlockReferenceReader struct {
+	lookupResults map[string]BlockReferenceResolution
+	loadResults   map[string]BlockReferenceResolution
+	lookupCalls   int
+	loadCalls     int
+	lookupIDs     []string
+	loadIDs       []string
+}
+
+func (reader *fakeBlockReferenceReader) LookupMany(_ context.Context, blockIDs []string) (map[string]BlockReferenceResolution, error) {
+	reader.lookupCalls++
+	reader.lookupIDs = append(reader.lookupIDs, blockIDs...)
+	resolved := make(map[string]BlockReferenceResolution, len(blockIDs))
+	for _, id := range blockIDs {
+		if resolution, ok := reader.lookupResults[id]; ok {
+			resolved[id] = resolution
+		} else {
+			resolved[id] = BlockReferenceResolution{BlockID: id, Status: MaterialSourceUnresolved}
+		}
+	}
+	return resolved, nil
+}
+
+func (reader *fakeBlockReferenceReader) Load(_ context.Context, blockID string) (BlockReferenceResolution, error) {
+	reader.loadCalls++
+	reader.loadIDs = append(reader.loadIDs, blockID)
+	if resolution, ok := reader.loadResults[blockID]; ok {
+		return resolution, nil
+	}
+	return BlockReferenceResolution{BlockID: blockID, Status: MaterialSourceUnresolved}, nil
+}
+
+func (reader *fakeBlockReferenceReader) sortedLookupIDs() []string {
+	ids := append([]string(nil), reader.lookupIDs...)
+	sort.Strings(ids)
+	return ids
 }

@@ -40,6 +40,7 @@ func TestSymemoRoutes(t *testing.T) {
 	registerSymemoRoutes(server)
 	want := map[string]bool{
 		"POST /api/symemo/getElementSubset":          false,
+		"POST /api/symemo/getElementTree":            false,
 		"POST /api/symemo/startLearning":             false,
 		"POST /api/symemo/showAnswer":                false,
 		"POST /api/symemo/gradeItem":                 false,
@@ -74,6 +75,7 @@ func TestSymemoHandlersRemainTransportOnly(t *testing.T) {
 	}
 	registrations := []string{
 		`ginServer.Handle("POST", "/api/symemo/getElementSubset", model.CheckAuth, model.CheckAdminRole, getSymemoElementSubset)`,
+		`ginServer.Handle("POST", "/api/symemo/getElementTree", model.CheckAuth, model.CheckAdminRole, getSymemoElementTree)`,
 		`ginServer.Handle("POST", "/api/symemo/startLearning", model.CheckAuth, model.CheckAdminRole, startSymemoLearning)`,
 		`ginServer.Handle("POST", "/api/symemo/showAnswer", model.CheckAuth, model.CheckAdminRole, showSymemoAnswer)`,
 		`ginServer.Handle("POST", "/api/symemo/gradeItem", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, gradeSymemoItem)`,
@@ -145,6 +147,49 @@ func TestSymemoTransportEnvelopeAndAnswerRedaction(t *testing.T) {
 	current := invokeSymemoHandler(t, getSymemoCurrentSession, `{}`)
 	if code := envelopeCode(t, current); code != 0 || !strings.Contains(string(envelopeData(t, current)), `"completed"`) {
 		t.Fatalf("current session envelope = %s", current.Body.String())
+	}
+}
+
+func TestSymemoElementTreeRoutes(t *testing.T) {
+	installSymemoFixtureWorkspace(t)
+	response := invokeSymemoHandler(t, getSymemoElementTree, `{"rootElementId":"20260720010101-rootaaa","includeScheduleSummary":true}`)
+	if code := envelopeCode(t, response); code != 0 {
+		t.Fatalf("tree envelope code = %d body=%s", code, response.Body.String())
+	}
+	var data struct {
+		Nodes []symemo.ElementTreeNode `json:"nodes"`
+	}
+	if err := json.Unmarshal(envelopeData(t, response), &data); err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Nodes) != 1 || data.Nodes[0].ElementID != "20260720010101-rootaaa" {
+		t.Fatalf("tree response nodes = %#v", data.Nodes)
+	}
+	if len(data.Nodes[0].Children) == 0 || data.Nodes[0].Children[0].ElementID != "20260720010102-itemaaa" {
+		t.Fatalf("tree children = %#v", data.Nodes[0].Children)
+	}
+	foundFuture := false
+	foundInvalidBlock := false
+	for _, child := range data.Nodes[0].Children {
+		if child.ElementID == "20260720010106-futurex" && child.SupportStatus == symemo.SupportStatusUnsupportedReadOnly {
+			foundFuture = true
+		}
+		if child.ElementID == "20260720010105-badblok" && child.MaterialSourceDiagnostic != nil && child.MaterialSourceStatus == nil {
+			foundInvalidBlock = true
+		}
+	}
+	if !foundFuture || !foundInvalidBlock {
+		t.Fatalf("tree response missing future or blocked material child: %#v", data.Nodes[0].Children)
+	}
+}
+
+func TestSymemoElementTreeMissingScopedRootUsesStableDomainError(t *testing.T) {
+	installSymemoFixtureWorkspace(t)
+	logs := captureSymemoErrorLogs(t)
+	response := invokeSymemoHandler(t, getSymemoElementTree, `{"rootElementId":"20260720999999-missing"}`)
+	assertSymemoFailure(t, response, "element-not-found", "The Element was not found.")
+	if len(*logs) != 0 {
+		t.Fatalf("missing scoped root logs=%#v", *logs)
 	}
 }
 

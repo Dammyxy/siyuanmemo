@@ -1,0 +1,13 @@
+{
+  "spec": 1,
+  "id": "20260720020203-incompl",
+  "type": "item",
+  "title": "Incomplete Item",
+  "processingState": "processed",
+  "payloadSpec": 1,
+  "payload": {
+    "kind": "qa",
+    "prompt": "Incomplete?"
+  },
+  "children": []
+}

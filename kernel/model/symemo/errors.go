@@ -35,6 +35,7 @@ const (
 	ErrProjectionRefreshFailed      ErrorCode = "projection-refresh-failed"
 	ErrQueueAdvanceFailed           ErrorCode = "queue-advance-failed"
 	ErrHistoryRequiresRepair        ErrorCode = "history-requires-repair"
+	ErrElementNotFound              ErrorCode = "element-not-found"
 )
 
 type DomainError struct {
