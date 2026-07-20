@@ -203,7 +203,7 @@ func TestRebuildDiagnosesMissingElementSource(t *testing.T) {
 	if err := os.Remove(missingPath); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.Refresh(context.Background()); err != nil {
+	if err := engine.refreshProjection(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	due, err := engine.Query(context.Background(), Query{Kind: QueryElementSubset, Subset: "due"})

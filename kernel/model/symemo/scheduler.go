@@ -22,14 +22,15 @@ import (
 )
 
 type Scheduler struct {
-	config Config
-	index  *projectionIndex
-	ledger *SchedulingLedger
-	arena  algorithmArena
+	config            Config
+	index             *projectionIndex
+	ledger            *SchedulingLedger
+	refreshProjection func(context.Context) error
+	arena             algorithmArena
 }
 
-func newScheduler(config Config, index *projectionIndex, ledger *SchedulingLedger, primary, fallback AlgorithmAdapter) *Scheduler {
-	return &Scheduler{config: config, index: index, ledger: ledger, arena: algorithmArena{primary: primary, fallback: fallback}}
+func newScheduler(config Config, index *projectionIndex, ledger *SchedulingLedger, refreshProjection func(context.Context) error, primary, fallback AlgorithmAdapter) *Scheduler {
+	return &Scheduler{config: config, index: index, ledger: ledger, refreshProjection: refreshProjection, arena: algorithmArena{primary: primary, fallback: fallback}}
 }
 
 func (scheduler *Scheduler) BuildQueue() ([]ReviewTarget, error) {
@@ -97,12 +98,29 @@ func (scheduler *Scheduler) ApplyGrade(ctx context.Context, target ReviewTarget,
 		Before:              before,
 		After:               after,
 	}
-	projection, alreadyAccepted, err := scheduler.ledger.Commit(ctx, event)
+	projection, alreadyAccepted, err := scheduler.ledger.Commit(event)
 	if err != nil {
 		if domainErr, ok := AsDomainError(err); ok {
 			domainErr.AcceptedEventID = event.EventID
 		}
 		return scheduleApplyResult{Event: event, Decision: decision, Candidates: candidates}, err
+	}
+	if !alreadyAccepted {
+		if err = scheduler.refreshProjection(ctx); err != nil {
+			domainErr := wrapDomainError(ErrProjectionRefreshFailed, "refresh scheduling projection: %v", err)
+			domainErr.Retryable = true
+			domainErr.ReviewAccepted = true
+			domainErr.AcceptedEventID = event.EventID
+			return scheduleApplyResult{Event: event, Decision: decision, Candidates: candidates}, domainErr
+		}
+		projection, err = scheduler.ledger.Snapshot(event.ElementID)
+		if err != nil {
+			domainErr := wrapDomainError(ErrProjectionRefreshFailed, "read refreshed scheduling projection: %v", err)
+			domainErr.Retryable = true
+			domainErr.ReviewAccepted = true
+			domainErr.AcceptedEventID = event.EventID
+			return scheduleApplyResult{Event: event, Decision: decision, Candidates: candidates}, domainErr
+		}
 	}
 	if alreadyAccepted {
 		event, _, _ = scheduler.ledger.EventByID(review.EventID)

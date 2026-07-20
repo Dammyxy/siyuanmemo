@@ -210,6 +210,13 @@ func (c Config) BootstrapSchedulerConfig() error {
 	if c.ReadOnly {
 		return nil
 	}
+	events, err := c.LoadEventFiles()
+	if err != nil {
+		return err
+	}
+	if len(events) > 0 {
+		return nil
+	}
 	if err := os.MkdirAll(c.SchedulerRoot, 0755); err != nil {
 		return err
 	}
@@ -507,7 +514,9 @@ func missingRootParents(root, relative string) []string {
 		if !ast.IsNodeIDPattern(ancestorDirs[len(ancestorDirs)-1]) {
 			continue
 		}
-		source := filepath.Join(append(ancestorDirs[:len(ancestorDirs)-1], ancestorDirs[len(ancestorDirs)-1]+".sme")...)
+		sourceParts := append([]string(nil), ancestorDirs[:len(ancestorDirs)-1]...)
+		sourceParts = append(sourceParts, ancestorDirs[len(ancestorDirs)-1]+".sme")
+		source := filepath.Join(sourceParts...)
 		if _, err := os.Stat(filepath.Join(root, source)); errors.Is(err, os.ErrNotExist) {
 			missing = append(missing, source)
 		}

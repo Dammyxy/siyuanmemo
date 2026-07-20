@@ -74,6 +74,9 @@ var serveCmd = &cobra.Command{
 
 		model.BootSyncData()
 		model.InitBoxes()
+		if err := model.InitSymemo(); err != nil {
+			logging.LogErrorf("initialize SiYuanMemo failed: %s", err)
+		}
 		model.LoadFlashcards()
 		util.LoadAssetsTexts()
 

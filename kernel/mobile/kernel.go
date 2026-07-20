@@ -220,6 +220,9 @@ func StartKernel(container, appDir, workspaceBaseDir, timezoneID, localIPs, lang
 
 		model.BootSyncData()
 		model.InitBoxes()
+		if err := model.InitSymemo(); err != nil {
+			logging.LogErrorf("initialize SiYuanMemo failed: %s", err)
+		}
 		model.LoadFlashcards()
 		util.LoadAssetsTexts()
 

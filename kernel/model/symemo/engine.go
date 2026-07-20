@@ -24,11 +24,13 @@ import (
 )
 
 type Engine struct {
-	config    Config
-	index     *projectionIndex
-	ledger    *SchedulingLedger
-	scheduler *Scheduler
-	session   *learningSession
+	config              Config
+	schedulerConfigHash string
+	index               *projectionIndex
+	ledger              *SchedulingLedger
+	scheduler           *Scheduler
+	session             *learningSession
+	unavailable         atomic.Bool
 }
 
 func NewEngine(ctx context.Context, config Config) (*Engine, error) {
@@ -41,14 +43,20 @@ func NewEngine(ctx context.Context, config Config) (*Engine, error) {
 		return nil, err
 	}
 	effectiveConfig := config.LoadEffectiveSchedulerConfig()
+	schedulerConfigHash, err := canonicalHash(effectiveConfig)
+	if err != nil {
+		index.close()
+		return nil, fmt.Errorf("hash scheduler configuration: %w", err)
+	}
 	ledger := newSchedulingLedger(config, index)
-	if err = ledger.Refresh(ctx); err != nil {
+	engine := &Engine{config: config, schedulerConfigHash: schedulerConfigHash, index: index, ledger: ledger}
+	if err = engine.refreshProjectionWithConfig(ctx, effectiveConfig); err != nil {
 		index.close()
 		return nil, fmt.Errorf("initialize scheduling projection: %w", err)
 	}
-	scheduler := newScheduler(config, index, ledger, NewFSRSV1Adapter(effectiveConfig.FSRS), NewSimpleV1Adapter())
-	engine := &Engine{config: config, index: index, ledger: ledger, scheduler: scheduler}
-	engine.session = newLearningSession(config, scheduler, ledger)
+	scheduler := newScheduler(config, index, ledger, engine.refreshProjection, NewFSRSV1Adapter(effectiveConfig.FSRS), NewSimpleV1Adapter())
+	engine.scheduler = scheduler
+	engine.session = newLearningSession(config, scheduler, ledger, engine.refreshProjection)
 	return engine, nil
 }
 
@@ -72,6 +80,9 @@ func (engine *Engine) SendToNote(context.Context, SendToNoteCommand) (SendToNote
 }
 
 func (engine *Engine) Query(ctx context.Context, query Query) (QueryResult, error) {
+	if engine.unavailable.Load() {
+		return QueryResult{}, projectionRebuildFailedError()
+	}
 	switch query.Kind {
 	case QueryElementSubset:
 		if query.Subset != "due" {
@@ -155,6 +166,9 @@ func (engine *Engine) Query(ctx context.Context, query Query) (QueryResult, erro
 }
 
 func (engine *Engine) RunLearningAction(ctx context.Context, action LearningAction) (LearningResult, error) {
+	if engine.unavailable.Load() {
+		return LearningResult{}, projectionRebuildFailedError()
+	}
 	if engine.config.ReadOnly && isSchedulingChangingAction(action.Kind) {
 		return LearningResult{}, domainError(ErrUnsupportedOperation, "scheduling changes are unavailable in read-only mode", nil)
 	}
@@ -169,20 +183,67 @@ func (engine *Engine) RunLearningAction(ctx context.Context, action LearningActi
 		if action.RawGrade == nil {
 			return LearningResult{}, domainError(ErrUnsupportedGrade, "raw grade is required", nil)
 		}
-		if !engine.config.LoadEffectiveSchedulerConfig().PersistedComplete {
+		if !engine.schedulerConfigIsCurrent() {
 			return LearningResult{}, domainError(ErrHistoryRequiresRepair, "scheduler configuration requires repair", nil)
 		}
-		return engine.session.Grade(ctx, action.ElementID, action.EventID, *action.RawGrade)
+		result, err := engine.session.Grade(ctx, action.ElementID, action.EventID, *action.RawGrade)
+		if domainErr, ok := AsDomainError(err); ok && domainErr.Code == ErrProjectionRefreshFailed {
+			engine.unavailable.Store(true)
+		}
+		return result, err
 	default:
 		return LearningResult{}, domainError(ErrUnsupportedOperation, "unsupported RunLearningAction variant", nil)
 	}
+}
+
+func (engine *Engine) schedulerConfigIsCurrent() bool {
+	effectiveConfig := engine.config.LoadEffectiveSchedulerConfig()
+	if !effectiveConfig.PersistedComplete {
+		return false
+	}
+	hash, err := canonicalHash(effectiveConfig)
+	return err == nil && hash == engine.schedulerConfigHash
+}
+
+func projectionRebuildFailedError() error {
+	return domainError(ErrProjectionRebuildFailed, "Element projection rebuild failed", nil)
 }
 
 func isSchedulingChangingAction(kind LearningActionKind) bool {
 	return kind == ActionGradeItem
 }
 
-func (engine *Engine) Refresh(ctx context.Context) error { return engine.ledger.Refresh(ctx) }
+func (engine *Engine) refreshProjection(ctx context.Context) error {
+	err := engine.refreshProjectionWithConfig(ctx, engine.config.LoadEffectiveSchedulerConfig())
+	if err != nil {
+		engine.unavailable.Store(true)
+	}
+	return err
+}
+
+func (engine *Engine) refreshProjectionWithConfig(ctx context.Context, effectiveConfig EffectiveSchedulerConfig) error {
+	scheduling, err := engine.ledger.Refresh(ctx)
+	if err != nil {
+		return err
+	}
+	elementScan, err := engine.config.scanElements()
+	if err != nil {
+		return err
+	}
+	sourceDiagnostics := sourceDiagnosticsWithMissingProjections(elementScan, scheduling.Projections)
+	if scheduling.HasEvents {
+		sourceDiagnostics = append(sourceDiagnostics, effectiveConfig.Diagnostics...)
+	}
+	sourceDiagnostics = normalizeSourceDiagnostics(sourceDiagnostics)
+	tree := buildElementTree(elementScan.Records, scheduling.Projections, true)
+	return engine.index.replaceAll(ctx, projectionBuild{
+		Elements:          elementScan.Elements,
+		Tree:              tree,
+		Projections:       scheduling.Projections,
+		EventDiagnostics:  scheduling.EventDiagnostics,
+		SourceDiagnostics: sourceDiagnostics,
+	})
+}
 
 var sessionSequence atomic.Uint64
 

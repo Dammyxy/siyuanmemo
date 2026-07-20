@@ -209,6 +209,10 @@ func LoadTreeByBlockIDWithReindex(id string) (ret *parse.Tree, err error) {
 
 // LoadTreeByBlockIDWithReindexInBox 与 LoadTreeByBlockIDWithReindex 一致，但按 boxID 路由 blocktree 查询。
 func LoadTreeByBlockIDWithReindexInBox(id, boxID string) (ret *parse.Tree, err error) {
+	return loadTreeByBlockIDWithReindexInBoxGuarded(id, boxID, nil)
+}
+
+func loadTreeByBlockIDWithReindexInBoxGuarded(id, boxID string, beforeLoad func(*treenode.BlockTree) error) (ret *parse.Tree, err error) {
 	if "" == id {
 		logging.LogWarnf("block id is empty")
 		return nil, ErrTreeNotFound
@@ -231,13 +235,18 @@ func LoadTreeByBlockIDWithReindexInBox(id, boxID string) (ret *parse.Tree, err e
 		}
 
 		// 尝试从文件系统加载并建立索引
-		err = indexTreeInFilesystem(id)
+		err = indexTreeInFilesystem(id, beforeLoad)
 		bt = treenode.GetBlockTreeInBox(id, boxID)
 		if nil == bt {
 			if "dev" == util.Mode {
 				logging.LogWarnf("block tree not found [id=%s], stack: [%s]", id, logging.ShortStack())
 			}
 			return
+		}
+	}
+	if beforeLoad != nil {
+		if err = beforeLoad(bt); err != nil {
+			return nil, err
 		}
 	}
 
@@ -302,7 +311,7 @@ func loadTreeByBlockIDInBox(id, boxID string) (ret *parse.Tree, err error) {
 
 var searchTreeLimiter = rate.NewLimiter(rate.Every(3*time.Second), 1)
 
-func indexTreeInFilesystem(blockID string) error {
+func indexTreeInFilesystem(blockID string, beforeLoad func(*treenode.BlockTree) error) error {
 	if !searchTreeLimiter.Allow() {
 		return ErrIndexing
 	}
@@ -337,6 +346,12 @@ func indexTreeInFilesystem(blockID string) error {
 		logging.LogInfof("box [%s] not found", boxID)
 		// 如果笔记本不存在则不处理 https://github.com/siyuan-note/siyuan/issues/11149
 		return ErrTreeNotFound
+	}
+	if beforeLoad != nil {
+		candidate := &treenode.BlockTree{ID: blockID, RootID: util.GetTreeID(unindexedTreePath), BoxID: boxID, Path: unindexedTreePath}
+		if err := beforeLoad(candidate); err != nil {
+			return err
+		}
 	}
 
 	tree, err := filesys.LoadTree(boxID, unindexedTreePath, util.NewLute())

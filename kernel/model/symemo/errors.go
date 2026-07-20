@@ -38,6 +38,7 @@ const (
 	ErrElementNotFound              ErrorCode = "element-not-found"
 	ErrElementSourceUnavailable     ErrorCode = "element-source-unavailable"
 	ErrElementSourceAmbiguous       ErrorCode = "element-source-ambiguous"
+	ErrProjectionRebuildFailed      ErrorCode = "projection-rebuild-failed"
 )
 
 type DomainError struct {

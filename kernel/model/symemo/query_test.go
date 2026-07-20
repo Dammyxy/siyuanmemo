@@ -274,7 +274,7 @@ func TestElementQueryClassifiesAmbiguousAndUnavailableSources(t *testing.T) {
 	if err := os.Remove(missingPath); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.Refresh(t.Context()); err != nil {
+	if err := engine.refreshProjection(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	result, err := engine.Query(t.Context(), Query{Kind: QueryElement, ElementID: secondFixtureElementID})

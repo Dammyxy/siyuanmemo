@@ -149,7 +149,7 @@ func TestLedgerInvalidKnownEventDoesNotBlockValidEnvelopeSibling(t *testing.T) {
 	file.Events = append(file.Events, invalid)
 	writeTestJSON(t, path, file)
 
-	if err = engine.Refresh(context.Background()); err != nil {
+	if err = engine.refreshProjection(context.Background()); err != nil {
 		t.Fatalf("compatible envelope refresh = %v", err)
 	}
 	projection, err := engine.ledger.Snapshot(fixtureElementID)
@@ -185,7 +185,7 @@ func TestLedgerBrokenEnvelopePreservesProjection(t *testing.T) {
 				t.Fatal(err)
 			}
 			test.breakFile(t, filepath.Join(config.ReviewsRoot(), "2026-07.smr"))
-			err = engine.Refresh(context.Background())
+			err = engine.refreshProjection(context.Background())
 			domainErr, ok := AsDomainError(err)
 			if !ok || domainErr.Code != ErrHistoryRequiresRepair || domainErr.Cause == nil {
 				t.Fatalf("broken envelope error = %#v", domainErr)
@@ -227,7 +227,7 @@ func TestLedgerUnknownEventTypePreservesProjection(t *testing.T) {
 	})
 	writeTestJSON(t, path, file)
 
-	if err = engine.Refresh(context.Background()); !hasCode(err, ErrHistoryRequiresRepair) {
+	if err = engine.refreshProjection(context.Background()); !hasCode(err, ErrHistoryRequiresRepair) {
 		t.Fatalf("unknown event refresh error = %v", err)
 	}
 	after, err := engine.ledger.Snapshot(fixtureElementID)

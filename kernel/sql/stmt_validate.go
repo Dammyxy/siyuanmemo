@@ -177,19 +177,6 @@ func CheckReadonlyStatement(stmt string) error {
 		if !ok {
 			return fmt.Errorf("SQL driver connection type is unexpected: %T", dc)
 		}
-		ds, err := sqliteConn.Prepare(stmt)
-		if err != nil {
-			return err
-		}
-		defer ds.Close()
-
-		sst, ok := ds.(*sqlite3.SQLiteStmt)
-		if !ok {
-			return fmt.Errorf("SQL driver statement type is unexpected: %T", ds)
-		}
-		if !sst.Readonly() {
-			return errors.New("SQL statement is not read-only")
-		}
-		return nil
+		return checkSQLiteReadonly(sqliteConn, stmt)
 	})
 }

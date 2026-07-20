@@ -191,6 +191,73 @@ func TestSchedulingWriteRequiresPersistedSchedulerConfig(t *testing.T) {
 	}
 }
 
+func TestSchedulingWriteRequiresEngineRebuildAfterSchedulerAuthorityRecovery(t *testing.T) {
+	config := copyFixtureWorkspace(t)
+	fsrsPath := filepath.Join(config.SchedulerRoot, "fsrs-v1.json")
+	data, err := os.ReadFile(fsrsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recoveredConfig SchedulerConfig
+	if err = json.Unmarshal(data, &recoveredConfig); err != nil {
+		t.Fatal(err)
+	}
+	recoveredConfig.MaximumIntervalDays = 2
+	if err = os.Remove(fsrsPath); err != nil {
+		t.Fatal(err)
+	}
+
+	engine, err := NewEngine(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	if _, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionStart}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionShowAnswer, ElementID: fixtureElementID}); err != nil {
+		t.Fatal(err)
+	}
+	writeTestJSON(t, fsrsPath, recoveredConfig)
+	before, err := config.LoadEventFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	grade := 4
+	if _, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionGradeItem, ElementID: fixtureElementID, RawGrade: &grade, EventID: "stale-scheduler-authority"}); !hasCode(err, ErrHistoryRequiresRepair) {
+		t.Fatalf("stale Engine grade error = %v", err)
+	}
+	after, err := config.LoadEventFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("stale Engine wrote review history: before=%d after=%d", len(before), len(after))
+	}
+	if err = engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement, err := NewEngine(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = replacement.Close() })
+	if _, err = replacement.RunLearningAction(t.Context(), LearningAction{Kind: ActionStart}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = replacement.RunLearningAction(t.Context(), LearningAction{Kind: ActionShowAnswer, ElementID: fixtureElementID}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := replacement.RunLearningAction(t.Context(), LearningAction{Kind: ActionGradeItem, ElementID: fixtureElementID, RawGrade: &grade, EventID: "recovered-scheduler-authority"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Projection == nil || result.Projection.IntervalDays != 3 {
+		t.Fatalf("recovered scheduler projection = %#v", result.Projection)
+	}
+}
+
 func TestSchedulerSemanticDiagnosticsIdentifyOwningFile(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -252,6 +319,24 @@ func TestBootstrapSchedulerConfigMissingOnlyAndReadOnlyBypass(t *testing.T) {
 	}
 	if _, err = os.Stat(missing); !os.IsNotExist(err) {
 		t.Fatalf("read-only bootstrap created optional config: %v", err)
+	}
+}
+
+func TestBootstrapSchedulerConfigDoesNotReplaceMissingHistoricalAuthority(t *testing.T) {
+	config := copyFixtureWorkspace(t)
+	missing := filepath.Join(config.SchedulerRoot, "fsrs-v1.json")
+	if err := os.Remove(missing); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotPaths(t, config.StorageRoot)
+	if err := config.BootstrapSchedulerConfig(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("bootstrap replaced missing historical scheduler authority: %v", err)
+	}
+	if after := snapshotPaths(t, config.StorageRoot); !equalStringMaps(before, after) {
+		t.Fatalf("bootstrap changed historical authority\nbefore=%#v\nafter=%#v", before, after)
 	}
 }
 

@@ -51,7 +51,7 @@ func (ledger *SchedulingLedger) Snapshot(elementID string) (SchedulingProjection
 	return projection, nil
 }
 
-func (ledger *SchedulingLedger) Commit(ctx context.Context, event SchedulingEvent) (SchedulingProjection, bool, error) {
+func (ledger *SchedulingLedger) Commit(event SchedulingEvent) (SchedulingProjection, bool, error) {
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
 	if event.EventID == "" || event.ElementID == "" || event.OccurredAt.IsZero() {
@@ -75,46 +75,32 @@ func (ledger *SchedulingLedger) Commit(ctx context.Context, event SchedulingEven
 		domainErr.Retryable = true
 		return SchedulingProjection{}, false, domainErr
 	}
-	if err = ledger.refreshLocked(ctx); err != nil {
-		domainErr := wrapDomainError(ErrProjectionRefreshFailed, "refresh scheduling projection: %v", err)
-		domainErr.Retryable = true
-		domainErr.ReviewAccepted = true
-		domainErr.AcceptedEventID = event.EventID
-		return SchedulingProjection{}, false, domainErr
-	}
-	projection, err := ledger.index.projection(event.ElementID)
-	return projection, false, err
+	return SchedulingProjection{}, false, nil
 }
 
-func (ledger *SchedulingLedger) Refresh(ctx context.Context) error {
+type schedulingRefreshResult struct {
+	Projections      map[string]SchedulingProjection
+	EventDiagnostics []EventDiagnostic
+	HasEvents        bool
+}
+
+func (ledger *SchedulingLedger) Refresh(ctx context.Context) (schedulingRefreshResult, error) {
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
-	return ledger.refreshLocked(ctx)
-}
-
-func (ledger *SchedulingLedger) refreshLocked(ctx context.Context) error {
-	elementScan, err := ledger.config.scanElements()
-	if err != nil {
-		return err
+	if err := ctx.Err(); err != nil {
+		return schedulingRefreshResult{}, err
 	}
 	events, err := ledger.config.LoadEventFiles()
 	if err != nil {
-		return err
+		return schedulingRefreshResult{}, err
 	}
 	for _, event := range events {
 		if _, fatal := validateSchedulingEvent(event); fatal {
-			return domainError(ErrHistoryRequiresRepair, "review history contains an unsupported event type", nil)
+			return schedulingRefreshResult{}, domainError(ErrHistoryRequiresRepair, "review history contains an unsupported event type", nil)
 		}
 	}
 	projections, diagnostics := projectSchedulingEvents(events)
-	sourceDiagnostics := sourceDiagnosticsWithMissingProjections(elementScan, projections)
-	effectiveConfig := ledger.config.LoadEffectiveSchedulerConfig()
-	if len(events) > 0 {
-		sourceDiagnostics = append(sourceDiagnostics, effectiveConfig.Diagnostics...)
-	}
-	sourceDiagnostics = normalizeSourceDiagnostics(sourceDiagnostics)
-	tree := buildElementTree(elementScan.Records, projections, true)
-	return ledger.index.replaceAll(ctx, projectionBuild{Elements: elementScan.Elements, Tree: tree, Projections: projections, EventDiagnostics: diagnostics, SourceDiagnostics: sourceDiagnostics})
+	return schedulingRefreshResult{Projections: projections, EventDiagnostics: diagnostics, HasEvents: len(events) > 0}, nil
 }
 
 func (ledger *SchedulingLedger) EventByID(eventID string) (SchedulingEvent, bool, error) {

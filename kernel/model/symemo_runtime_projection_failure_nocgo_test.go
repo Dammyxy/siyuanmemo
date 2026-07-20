@@ -5,26 +5,20 @@
 // it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //go:build !cgo
 
-package symemo
+package model
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/siyuan-note/siyuan/kernel/model/symemo"
 )
 
-func installProjectionRefreshFailure(t *testing.T, _ *Engine, config Config) func() {
+func installRuntimeProjectionRefreshFailure(t *testing.T, config symemo.Config) func() {
 	t.Helper()
 	indexPath := config.IndexPath()
 	if err := os.Remove(indexPath); err != nil {
@@ -48,14 +42,4 @@ func installProjectionRefreshFailure(t *testing.T, _ *Engine, config Config) fun
 	}
 	t.Cleanup(restore)
 	return restore
-}
-
-func writeProjectionSchemaMismatch(t *testing.T, engine *Engine) {
-	t.Helper()
-	engine.index.mu.Lock()
-	defer engine.index.mu.Unlock()
-	engine.index.data.SchemaVersion = 0
-	if err := engine.index.saveLocked(); err != nil {
-		t.Fatal(err)
-	}
 }

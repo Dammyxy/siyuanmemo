@@ -44,3 +44,10 @@ END`)
 	t.Cleanup(restore)
 	return restore
 }
+
+func writeProjectionSchemaMismatch(t *testing.T, engine *Engine) {
+	t.Helper()
+	if _, err := engine.index.db.Exec("UPDATE metadata SET value = '0' WHERE key = 'schema_version'"); err != nil {
+		t.Fatal(err)
+	}
+}

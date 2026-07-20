@@ -17,6 +17,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/88250/gulu"
@@ -24,7 +25,16 @@ import (
 	"github.com/siyuan-note/logging"
 	"github.com/siyuan-note/siyuan/kernel/model"
 	"github.com/siyuan-note/siyuan/kernel/model/symemo"
+	"github.com/siyuan-note/siyuan/kernel/util"
 )
+
+var symemoIsBooted = util.IsBooted
+var symemoBootProgress = func() int { return int(util.GetBootProgress()) }
+var symemoBootMessage = func(progress int) string {
+	return fmt.Sprintf(model.Conf.Language(74), progress)
+}
+var symemoQuery = model.QuerySymemo
+var symemoRunLearningAction = model.RunSymemoLearningAction
 
 var symemoLogError = func(code string, cause error) {
 	logging.LogErrorf("SiYuanMemo request failed [code=%s]: %s", code, cause)
@@ -52,6 +62,7 @@ var symemoSafeMessages = map[string]string{
 	string(symemo.ErrElementNotFound):              "The Element was not found.",
 	string(symemo.ErrElementSourceUnavailable):     "The Element source is unavailable.",
 	string(symemo.ErrElementSourceAmbiguous):       "The Element source is ambiguous.",
+	string(symemo.ErrProjectionRebuildFailed):      "The Element index could not be rebuilt.",
 }
 
 func registerSymemoRoutes(ginServer *gin.Engine) {
@@ -94,12 +105,10 @@ func getSymemoElementSubset(c *gin.Context) {
 	if !bindSymemoRequest(c, &request) {
 		return
 	}
-	engine, err := model.GetSymemoEngine()
-	if err != nil {
-		writeSymemoError(c, err)
+	if !ensureSymemoBooted(c) {
 		return
 	}
-	result, err := engine.Query(c, symemo.Query{Kind: symemo.QueryElementSubset, Subset: request.Subset})
+	result, err := symemoQuery(c, symemo.Query{Kind: symemo.QueryElementSubset, Subset: request.Subset})
 	if err != nil {
 		writeSymemoError(c, err)
 		return
@@ -112,12 +121,10 @@ func getSymemoElementTree(c *gin.Context) {
 	if !bindSymemoRequest(c, &request) {
 		return
 	}
-	engine, err := model.GetSymemoEngine()
-	if err != nil {
-		writeSymemoError(c, err)
+	if !ensureSymemoBooted(c) {
 		return
 	}
-	result, err := engine.Query(c, symemo.Query{Kind: symemo.QueryElementTree, RootElementID: request.RootElementID, IncludeScheduleSummary: request.IncludeScheduleSummary})
+	result, err := symemoQuery(c, symemo.Query{Kind: symemo.QueryElementTree, RootElementID: request.RootElementID, IncludeScheduleSummary: request.IncludeScheduleSummary})
 	if err != nil {
 		writeSymemoError(c, err)
 		return
@@ -125,17 +132,23 @@ func getSymemoElementTree(c *gin.Context) {
 	writeSymemoSuccess(c, result)
 }
 
+func ensureSymemoBooted(c *gin.Context) bool {
+	if symemoIsBooted() {
+		return true
+	}
+	writeSymemoFailure(c, symemoBootMessage(symemoBootProgress()), map[string]any{"closeTimeout": 5000})
+	return false
+}
+
 func getSymemoElement(c *gin.Context) {
 	var request symemoElementRequest
 	if !bindSymemoRequest(c, &request) {
 		return
 	}
-	engine, err := model.GetSymemoEngine()
-	if err != nil {
-		writeSymemoError(c, err)
+	if !ensureSymemoBooted(c) {
 		return
 	}
-	result, err := engine.Query(c, symemo.Query{Kind: symemo.QueryElement, ElementID: request.ElementID})
+	result, err := symemoQuery(c, symemo.Query{Kind: symemo.QueryElement, ElementID: request.ElementID})
 	if err != nil {
 		writeSymemoError(c, err)
 		return
@@ -148,12 +161,10 @@ func getSymemoElementSourceDiagnostics(c *gin.Context) {
 	if !bindSymemoRequest(c, &request) {
 		return
 	}
-	engine, err := model.GetSymemoEngine()
-	if err != nil {
-		writeSymemoError(c, err)
+	if !ensureSymemoBooted(c) {
 		return
 	}
-	result, err := engine.Query(c, symemo.Query{Kind: symemo.QueryElementSourceDiagnostics, ElementID: request.ElementID, SourcePath: request.SourcePath})
+	result, err := symemoQuery(c, symemo.Query{Kind: symemo.QueryElementSourceDiagnostics, ElementID: request.ElementID, SourcePath: request.SourcePath})
 	if err != nil {
 		writeSymemoError(c, err)
 		return
@@ -176,12 +187,10 @@ func startSymemoLearning(c *gin.Context) {
 	if !bindSymemoEmptyRequest(c) {
 		return
 	}
-	engine, err := model.GetSymemoEngine()
-	if err != nil {
-		writeSymemoError(c, err)
+	if !ensureSymemoBooted(c) {
 		return
 	}
-	result, err := engine.RunLearningAction(c, symemo.LearningAction{Kind: symemo.ActionStart})
+	result, err := symemoRunLearningAction(c, symemo.LearningAction{Kind: symemo.ActionStart})
 	if err != nil {
 		writeSymemoError(c, err)
 		return
@@ -194,12 +203,10 @@ func showSymemoAnswer(c *gin.Context) {
 	if !bindSymemoRequest(c, &request) {
 		return
 	}
-	engine, err := model.GetSymemoEngine()
-	if err != nil {
-		writeSymemoError(c, err)
+	if !ensureSymemoBooted(c) {
 		return
 	}
-	result, err := engine.RunLearningAction(c, symemo.LearningAction{Kind: symemo.ActionShowAnswer, ElementID: request.ElementID})
+	result, err := symemoRunLearningAction(c, symemo.LearningAction{Kind: symemo.ActionShowAnswer, ElementID: request.ElementID})
 	if err != nil {
 		writeSymemoError(c, err)
 		return
@@ -212,12 +219,10 @@ func gradeSymemoItem(c *gin.Context) {
 	if !bindSymemoRequest(c, &request) {
 		return
 	}
-	engine, err := model.GetSymemoEngine()
-	if err != nil {
-		writeSymemoError(c, err)
+	if !ensureSymemoBooted(c) {
 		return
 	}
-	result, err := engine.RunLearningAction(c, symemo.LearningAction{Kind: symemo.ActionGradeItem, ElementID: request.ElementID, RawGrade: request.RawGrade, EventID: request.EventID})
+	result, err := symemoRunLearningAction(c, symemo.LearningAction{Kind: symemo.ActionGradeItem, ElementID: request.ElementID, RawGrade: request.RawGrade, EventID: request.EventID})
 	if err != nil {
 		writeSymemoError(c, err)
 		return
@@ -229,12 +234,10 @@ func getSymemoCurrentSession(c *gin.Context) {
 	if !bindSymemoEmptyRequest(c) {
 		return
 	}
-	engine, err := model.GetSymemoEngine()
-	if err != nil {
-		writeSymemoError(c, err)
+	if !ensureSymemoBooted(c) {
 		return
 	}
-	result, err := engine.Query(c, symemo.Query{Kind: symemo.QueryCurrentSession})
+	result, err := symemoQuery(c, symemo.Query{Kind: symemo.QueryCurrentSession})
 	if err != nil {
 		writeSymemoError(c, err)
 		return

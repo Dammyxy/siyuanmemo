@@ -57,7 +57,7 @@ func TestSessionUnreadableHistoryFailure(t *testing.T) {
 	}
 }
 
-func TestProjectionFailureRecovery(t *testing.T) {
+func TestProjectionFailureLocksEngineUntilReplacement(t *testing.T) {
 	engine, config := newFixtureEngine(t)
 	if _, err := engine.RunLearningAction(context.Background(), LearningAction{Kind: ActionStart}); err != nil {
 		t.Fatal(err)
@@ -68,12 +68,16 @@ func TestProjectionFailureRecovery(t *testing.T) {
 	restoreProjection := installProjectionRefreshFailure(t, engine, config)
 	grade := 4
 	_, err := engine.RunLearningAction(context.Background(), LearningAction{Kind: ActionGradeItem, ElementID: fixtureElementID, RawGrade: &grade, EventID: "projection-failure"})
-	if !hasCode(err, ErrProjectionRefreshFailed) {
-		t.Fatalf("error = %v", err)
+	domainErr, ok := AsDomainError(err)
+	if !ok || domainErr.Code != ErrProjectionRefreshFailed || !domainErr.ReviewAccepted || domainErr.AcceptedEventID != "projection-failure" {
+		t.Fatalf("accepted trigger error = %#v", err)
 	}
 	restoreProjection()
-	if _, err = engine.RunLearningAction(context.Background(), LearningAction{Kind: ActionGradeItem, ElementID: fixtureElementID, RawGrade: &grade, EventID: "projection-failure"}); err != nil {
-		t.Fatalf("retry accepted event = %v", err)
+	if _, err = engine.Query(context.Background(), Query{Kind: QueryCurrentSession}); !hasCode(err, ErrProjectionRebuildFailed) {
+		t.Fatalf("query after projection failure = %v", err)
+	}
+	if _, err = engine.RunLearningAction(context.Background(), LearningAction{Kind: ActionStart}); !hasCode(err, ErrProjectionRebuildFailed) {
+		t.Fatalf("learning action after projection failure = %v", err)
 	}
 }
 

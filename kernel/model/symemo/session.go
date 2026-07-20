@@ -22,18 +22,19 @@ import (
 )
 
 type learningSession struct {
-	config           Config
-	scheduler        *Scheduler
-	ledger           *SchedulingLedger
-	mu               sync.Mutex
-	state            SessionState
-	currentAnswer    string
-	remainingTargets []ReviewTarget
-	pendingErrorCode ErrorCode
+	config            Config
+	scheduler         *Scheduler
+	ledger            *SchedulingLedger
+	refreshProjection func(context.Context) error
+	mu                sync.Mutex
+	state             SessionState
+	currentAnswer     string
+	remainingTargets  []ReviewTarget
+	pendingErrorCode  ErrorCode
 }
 
-func newLearningSession(config Config, scheduler *Scheduler, ledger *SchedulingLedger) *learningSession {
-	return &learningSession{config: config, scheduler: scheduler, ledger: ledger, state: SessionState{Status: SessionCompleted, Phase: PhaseComplete}}
+func newLearningSession(config Config, scheduler *Scheduler, ledger *SchedulingLedger, refreshProjection func(context.Context) error) *learningSession {
+	return &learningSession{config: config, scheduler: scheduler, ledger: ledger, refreshProjection: refreshProjection, state: SessionState{Status: SessionCompleted, Phase: PhaseComplete}}
 }
 
 func (session *learningSession) Current() SessionState {
@@ -106,7 +107,7 @@ func (session *learningSession) Grade(ctx context.Context, elementID, eventID st
 		if !eventMatchesGrade(existing, session.state.SessionID, elementID, rawGrade) {
 			return LearningResult{}, domainErrorWithSession(ErrHistoryRequiresRepair, "event identity has conflicting review facts", session.publicState())
 		}
-		if err := session.ledger.Refresh(ctx); err != nil {
+		if err := session.refreshProjection(ctx); err != nil {
 			return LearningResult{}, session.pendingAcceptedError("refresh accepted review", err)
 		}
 		return session.finishAccepted(ctx, eventID)

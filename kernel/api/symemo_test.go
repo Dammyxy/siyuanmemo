@@ -17,7 +17,9 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -56,11 +58,167 @@ func TestSymemoRoutes(t *testing.T) {
 		if strings.Contains(route.Path, "executeCommand") {
 			t.Fatalf("generic command route is forbidden: %s", route.Path)
 		}
+		if strings.Contains(route.Path, "/api/symemo/") && (strings.Contains(strings.ToLower(route.Path), "rebuild") || strings.Contains(strings.ToLower(route.Path), "refresh")) {
+			t.Fatalf("projection maintenance route is forbidden: %s", route.Path)
+		}
 	}
 	for route, found := range want {
 		if !found {
 			t.Errorf("missing route %s", route)
 		}
+	}
+}
+
+func TestSymemoPreBootRequestUsesNativeProgressWithoutRuntimeCall(t *testing.T) {
+	previousBooted, previousProgress, previousMessage := symemoIsBooted, symemoBootProgress, symemoBootMessage
+	previousQuery := symemoQuery
+	symemoIsBooted = func() bool { return false }
+	symemoBootProgress = func() int { return 42 }
+	symemoBootMessage = func(progress int) string { return fmt.Sprintf("Loading %d%%", progress) }
+	queryCalls := 0
+	symemoQuery = func(context.Context, symemo.Query) (symemo.QueryResult, error) {
+		queryCalls++
+		return symemo.QueryResult{}, nil
+	}
+	t.Cleanup(func() {
+		symemoIsBooted, symemoBootProgress, symemoBootMessage = previousBooted, previousProgress, previousMessage
+		symemoQuery = previousQuery
+	})
+
+	response := invokeSymemoHandler(t, getSymemoElementTree, `{}`)
+	var envelope struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			CloseTimeout int `json:"closeTimeout"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Code != -1 || envelope.Msg != "Loading 42%" || envelope.Data.CloseTimeout != 5000 || queryCalls != 0 {
+		t.Fatalf("pre-boot response=%#v queryCalls=%d", envelope, queryCalls)
+	}
+}
+
+func TestSymemoHandlersUseRuntimeFacadeExactlyOnce(t *testing.T) {
+	previousBooted := symemoIsBooted
+	previousQuery, previousLearningAction := symemoQuery, symemoRunLearningAction
+	symemoIsBooted = func() bool { return true }
+	queryCalls, learningActionCalls := 0, 0
+	symemoQuery = func(context.Context, symemo.Query) (symemo.QueryResult, error) {
+		queryCalls++
+		return symemo.QueryResult{}, nil
+	}
+	symemoRunLearningAction = func(context.Context, symemo.LearningAction) (symemo.LearningResult, error) {
+		learningActionCalls++
+		return symemo.LearningResult{}, nil
+	}
+	t.Cleanup(func() {
+		symemoIsBooted = previousBooted
+		symemoQuery, symemoRunLearningAction = previousQuery, previousLearningAction
+	})
+
+	tests := []struct {
+		name        string
+		handler     gin.HandlerFunc
+		body        string
+		wantQueries int
+		wantActions int
+	}{
+		{"element subset", getSymemoElementSubset, `{"subset":"due"}`, 1, 0},
+		{"element tree", getSymemoElementTree, `{}`, 1, 0},
+		{"element", getSymemoElement, `{"elementId":"20260719010101-abcdefg"}`, 1, 0},
+		{"source diagnostics", getSymemoElementSourceDiagnostics, `{}`, 1, 0},
+		{"start learning", startSymemoLearning, `{}`, 0, 1},
+		{"show answer", showSymemoAnswer, `{"elementId":"20260719010101-abcdefg"}`, 0, 1},
+		{"grade item", gradeSymemoItem, `{"elementId":"20260719010101-abcdefg","rawGrade":4,"eventId":"event-1"}`, 0, 1},
+		{"current session", getSymemoCurrentSession, `{}`, 1, 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			queryCalls, learningActionCalls = 0, 0
+			response := invokeSymemoHandler(t, test.handler, test.body)
+			if code := envelopeCode(t, response); code != 0 {
+				t.Fatalf("envelope code = %d body=%s", code, response.Body.String())
+			}
+			if queryCalls != test.wantQueries || learningActionCalls != test.wantActions {
+				t.Fatalf("facade calls query=%d action=%d, want query=%d action=%d", queryCalls, learningActionCalls, test.wantQueries, test.wantActions)
+			}
+		})
+	}
+}
+
+func TestSymemoReadRoutesDoNotMutateReviewsOrSession(t *testing.T) {
+	storageRoot := installSymemoFixtureWorkspace(t)
+	beforeReviews := snapshotSymemoDirectory(t, filepath.Join(storageRoot, "reviews"))
+	beforeSession := envelopeData(t, invokeSymemoHandler(t, getSymemoCurrentSession, `{}`))
+
+	for _, request := range []struct {
+		handler gin.HandlerFunc
+		body    string
+	}{
+		{getSymemoElementSubset, `{"subset":"due"}`},
+		{getSymemoElementTree, `{}`},
+		{getSymemoElement, `{"elementId":"` + symemoFixtureElementID + `"}`},
+		{getSymemoElementSourceDiagnostics, `{}`},
+		{getSymemoCurrentSession, `{}`},
+	} {
+		response := invokeSymemoHandler(t, request.handler, request.body)
+		if code := envelopeCode(t, response); code != 0 {
+			t.Fatalf("read route failed: %s", response.Body.String())
+		}
+	}
+	afterSession := envelopeData(t, invokeSymemoHandler(t, getSymemoCurrentSession, `{}`))
+	if string(afterSession) != string(beforeSession) {
+		t.Fatalf("read routes changed session\nafter=%s\nbefore=%s", afterSession, beforeSession)
+	}
+	afterReviews := snapshotSymemoDirectory(t, filepath.Join(storageRoot, "reviews"))
+	if string(afterReviews) != string(beforeReviews) {
+		t.Fatal("read routes changed review history")
+	}
+}
+
+func TestSymemoAcceptedTriggerRecoveryAndSubsequentLatch(t *testing.T) {
+	previousBooted := symemoIsBooted
+	previousQuery, previousLearningAction := symemoQuery, symemoRunLearningAction
+	symemoIsBooted = func() bool { return true }
+	eventID := "20260721120000-api-latch"
+	session := &symemo.SessionState{Status: symemo.SessionActive, Phase: symemo.PhaseAnswer, PendingAcceptedEventID: eventID}
+	symemoRunLearningAction = func(context.Context, symemo.LearningAction) (symemo.LearningResult, error) {
+		return symemo.LearningResult{}, &symemo.DomainError{Code: symemo.ErrProjectionRefreshFailed, Retryable: true, ReviewAccepted: true, AcceptedEventID: eventID, Session: session}
+	}
+	symemoQuery = func(context.Context, symemo.Query) (symemo.QueryResult, error) {
+		return symemo.QueryResult{}, &symemo.DomainError{Code: symemo.ErrProjectionRebuildFailed}
+	}
+	t.Cleanup(func() {
+		symemoIsBooted = previousBooted
+		symemoQuery, symemoRunLearningAction = previousQuery, previousLearningAction
+	})
+
+	trigger := invokeSymemoHandler(t, gradeSymemoItem, `{"elementId":"`+symemoFixtureElementID+`","rawGrade":4,"eventId":"`+eventID+`"}`)
+	var triggerEnvelope struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			ErrorCode      string               `json:"errorCode"`
+			Retryable      bool                 `json:"retryable"`
+			ReviewAccepted bool                 `json:"reviewAccepted"`
+			AcceptedEvent  string               `json:"acceptedEventId"`
+			Session        *symemo.SessionState `json:"session"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(trigger.Body.Bytes(), &triggerEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	if triggerEnvelope.Code != -1 || triggerEnvelope.Msg != "The review was saved, but its schedule could not be refreshed." || triggerEnvelope.Data.ErrorCode != string(symemo.ErrProjectionRefreshFailed) || !triggerEnvelope.Data.Retryable || !triggerEnvelope.Data.ReviewAccepted || triggerEnvelope.Data.AcceptedEvent != eventID || triggerEnvelope.Data.Session == nil || triggerEnvelope.Data.Session.PendingAcceptedEventID != eventID {
+		t.Fatalf("accepted trigger envelope = %#v", triggerEnvelope)
+	}
+
+	latched := invokeSymemoHandler(t, getSymemoCurrentSession, `{}`)
+	assertSymemoFailure(t, latched, string(symemo.ErrProjectionRebuildFailed), "The Element index could not be rebuilt.")
+	if strings.Contains(latched.Body.String(), eventID) || strings.Contains(latched.Body.String(), "completed") {
+		t.Fatalf("latched response exposed prior data: %s", latched.Body.String())
 	}
 }
 
@@ -70,7 +228,7 @@ func TestSymemoHandlersRemainTransportOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := string(data)
-	for _, forbidden := range []string{"SchedulingLedger", "filelock.", "memo.db", "/api/symemo/executeCommand", "github.com/siyuan-note/riff"} {
+	for _, forbidden := range []string{"SchedulingLedger", "filelock.", "memo.db", "/api/symemo/executeCommand", "github.com/siyuan-note/riff", "GetSymemoEngine", "kernel-not-ready"} {
 		if strings.Contains(source, forbidden) {
 			t.Errorf("transport adapter contains forbidden workflow dependency %q", forbidden)
 		}
@@ -209,6 +367,7 @@ func TestSymemoElementReadRoutes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(elementsRoot, duplicateID+".sme"), []byte(duplicate), 0644); err != nil {
 		t.Fatal(err)
 	}
+	restartSymemoRuntime(t)
 
 	known := invokeSymemoHandler(t, getSymemoElement, `{"elementId":"`+symemoFixtureElementID+`"}`)
 	if code := envelopeCode(t, known); code != 0 {
@@ -247,6 +406,7 @@ func TestSymemoElementDiagnosticRoutes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(elementsRoot, duplicateID+".sme"), []byte(duplicate), 0644); err != nil {
 		t.Fatal(err)
 	}
+	restartSymemoRuntime(t)
 
 	filtered := invokeSymemoHandler(t, getSymemoElementSourceDiagnostics, `{"elementId":"`+duplicateID+`"}`)
 	filteredData := envelopeData(t, filtered)
@@ -311,14 +471,16 @@ func TestSymemoUnexpectedRouteFailureIsSanitizedAndLoggedOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	installSymemoRuntimePaths(t, root, blocker)
+	if err := installSymemoRuntimePaths(t, root, blocker); err == nil {
+		t.Fatal("expected Runtime initialization failure")
+	}
 
 	response := invokeSymemoHandler(t, getSymemoCurrentSession, `{}`)
-	assertSymemoFailure(t, response, "internal-error", "SiYuanMemo could not complete the request.")
+	assertSymemoFailure(t, response, string(symemo.ErrProjectionRebuildFailed), "The Element index could not be rebuilt.")
 	if strings.Contains(response.Body.String(), blocker) || strings.Contains(response.Body.String(), "not a directory") {
 		t.Fatalf("unexpected failure leaked internals: %s", response.Body.String())
 	}
-	if len(*logs) != 1 || (*logs)[0].code != "internal-error" || !strings.Contains((*logs)[0].cause, "not-a-directory") {
+	if len(*logs) != 1 || (*logs)[0].code != string(symemo.ErrProjectionRebuildFailed) || !strings.Contains((*logs)[0].cause, "not-a-directory") {
 		t.Fatalf("unexpected failure logs=%#v", *logs)
 	}
 }
@@ -348,23 +510,66 @@ func installSymemoFixtureWorkspace(t *testing.T) string {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	installSymemoRuntimePaths(t, filepath.Join(workspaceRoot, "data"), filepath.Join(workspaceRoot, "temp"))
+	if err := installSymemoRuntimePaths(t, filepath.Join(workspaceRoot, "data"), filepath.Join(workspaceRoot, "temp")); err != nil {
+		t.Fatal(err)
+	}
 	return storageRoot
 }
 
-func installSymemoRuntimePaths(t *testing.T, dataDir, tempDir string) {
+func installSymemoRuntimePaths(t *testing.T, dataDir, tempDir string) error {
 	t.Helper()
 	if err := model.CloseSymemoEngine(); err != nil {
 		t.Fatal(err)
 	}
 	previousDataDir, previousTempDir := util.DataDir, util.TempDir
+	previousBooted := symemoIsBooted
 	util.DataDir, util.TempDir = dataDir, tempDir
+	symemoIsBooted = func() bool { return true }
+	initErr := model.InitSymemo()
 	t.Cleanup(func() {
 		if err := model.CloseSymemoEngine(); err != nil {
 			t.Error(err)
 		}
 		util.DataDir, util.TempDir = previousDataDir, previousTempDir
+		symemoIsBooted = previousBooted
 	})
+	return initErr
+}
+
+func restartSymemoRuntime(t *testing.T) {
+	t.Helper()
+	if err := model.CloseSymemoEngine(); err != nil {
+		t.Fatal(err)
+	}
+	if err := model.InitSymemo(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func snapshotSymemoDirectory(t *testing.T, root string) []byte {
+	t.Helper()
+	files := map[string][]byte{}
+	if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		files[filepath.ToSlash(relative)], err = os.ReadFile(path)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func invokeSymemoHandler(t *testing.T, handler gin.HandlerFunc, body string) *httptest.ResponseRecorder {
