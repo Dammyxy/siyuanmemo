@@ -1,0 +1,6 @@
+{
+  "spec": 1,
+  "primary": "fsrs-v1",
+  "enabledAlgorithms": ["fsrs-v1", "simple-v1"],
+  "fallback": "simple-v1"
+}

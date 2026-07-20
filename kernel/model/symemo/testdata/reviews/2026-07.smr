@@ -1,0 +1,64 @@
+{
+  "spec": 1,
+  "month": "2026-07",
+  "events": [
+    {
+      "spec": 1,
+      "eventId": "20260716080000-intro001",
+      "occurredAt": "2026-07-16T08:00:00+08:00",
+      "type": "introduceElement",
+      "elementId": "20260719010101-abcdefg",
+      "baseSchedulingEventId": null,
+      "before": {
+        "elementId": "20260719010101-abcdefg",
+        "lifecycleState": "pending",
+        "dueAt": "2026-07-16T08:00:00+08:00",
+        "intervalDays": 0,
+        "repetitions": 0,
+        "lapses": 0,
+        "priorityPosition": 0
+      },
+      "after": {
+        "elementId": "20260719010101-abcdefg",
+        "lifecycleState": "memorized",
+        "adoptedTerminalEventId": "20260716080000-intro001",
+        "dueAt": "2026-07-19T08:00:00+08:00",
+        "intervalDays": 3,
+        "repetitions": 1,
+        "lapses": 0,
+        "lastReviewAt": "2026-07-16T08:00:00+08:00",
+        "lastLearningDate": "2026-07-16",
+        "activeAlgorithm": "fsrs-v1",
+        "algorithmStates": {
+          "fsrs-v1": {
+            "algorithm": "fsrs-v1",
+            "schemaVersion": 1,
+            "state": {
+              "cardState": "review",
+              "dueAt": "2026-07-19T08:00:00+08:00",
+              "stability": 3,
+              "difficulty": 5,
+              "elapsedDays": 3,
+              "scheduledDays": 3,
+              "repetitions": 1,
+              "lapses": 0,
+              "lastReviewAt": "2026-07-16T08:00:00+08:00"
+            }
+          },
+          "simple-v1": {
+            "algorithm": "simple-v1",
+            "schemaVersion": 1,
+            "state": {
+              "intervalDays": 3,
+              "repetitions": 1,
+              "lapses": 0,
+              "lastReviewAt": "2026-07-16T08:00:00+08:00",
+              "dueAt": "2026-07-19T08:00:00+08:00"
+            }
+          }
+        },
+        "priorityPosition": 0
+      }
+    }
+  ]
+}

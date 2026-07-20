@@ -1,0 +1,125 @@
+{
+  "spec": 1,
+  "month": "fixture",
+  "events": [
+    {
+      "spec": 1,
+      "eventId": "root",
+      "occurredAt": "2026-07-16T08:00:00+08:00",
+      "type": "introduceElement",
+      "elementId": "20260719010101-abcdefg",
+      "before": {"elementId": "20260719010101-abcdefg"},
+      "after": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "root", "dueAt": "2026-07-19T08:00:00+08:00", "intervalDays": 3, "repetitions": 1, "priorityPosition": 0}
+    },
+    {
+      "spec": 1,
+      "eventId": "branch-a",
+      "occurredAt": "2026-07-19T10:00:00+08:00",
+      "type": "reviewElement",
+      "elementId": "20260719010101-abcdefg",
+      "baseSchedulingEventId": "root",
+      "before": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "root", "dueAt": "2026-07-19T08:00:00+08:00", "intervalDays": 3, "repetitions": 1, "priorityPosition": 0},
+      "after": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "branch-a", "dueAt": "2026-07-20T10:00:00+08:00", "intervalDays": 1, "repetitions": 2, "priorityPosition": 0}
+    },
+    {
+      "spec": 1,
+      "eventId": "branch-b",
+      "occurredAt": "2026-07-19T11:00:00+08:00",
+      "type": "reviewElement",
+      "elementId": "20260719010101-abcdefg",
+      "baseSchedulingEventId": "root",
+      "before": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "root", "dueAt": "2026-07-19T08:00:00+08:00", "intervalDays": 3, "repetitions": 1, "priorityPosition": 0},
+      "after": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "branch-b", "dueAt": "2026-07-21T11:00:00+08:00", "intervalDays": 2, "repetitions": 2, "priorityPosition": 0}
+    },
+    {
+      "spec": 1,
+      "eventId": "branch-a2",
+      "occurredAt": "2026-07-19T12:00:00+08:00",
+      "type": "reviewElement",
+      "elementId": "20260719010101-abcdefg",
+      "baseSchedulingEventId": "branch-a",
+      "before": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "branch-a", "dueAt": "2026-07-20T10:00:00+08:00", "intervalDays": 1, "repetitions": 2, "priorityPosition": 0},
+      "after": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "branch-a2", "dueAt": "2026-07-22T12:00:00+08:00", "intervalDays": 2, "repetitions": 3, "priorityPosition": 0}
+    },
+    {
+      "spec": 1,
+      "eventId": "branch-b",
+      "occurredAt": "2026-07-19T11:00:00+08:00",
+      "type": "reviewElement",
+      "elementId": "20260719010101-abcdefg",
+      "baseSchedulingEventId": "root",
+      "before": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "root", "dueAt": "2026-07-19T08:00:00+08:00", "intervalDays": 3, "repetitions": 1, "priorityPosition": 0},
+      "after": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "branch-b", "dueAt": "2026-07-21T11:00:00+08:00", "intervalDays": 2, "repetitions": 2, "priorityPosition": 0}
+    },
+    {
+      "spec": 1,
+      "eventId": "missing",
+      "occurredAt": "2026-07-19T13:00:00+08:00",
+      "type": "reviewElement",
+      "elementId": "20260719010101-abcdefg",
+      "baseSchedulingEventId": "not-found",
+      "before": {"elementId": "20260719010101-abcdefg"},
+      "after": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "missing", "dueAt": "2026-07-23T13:00:00+08:00", "repetitions": 2}
+    },
+    {
+      "spec": 1,
+      "eventId": "cross",
+      "occurredAt": "2026-07-19T14:00:00+08:00",
+      "type": "reviewElement",
+      "elementId": "other-item",
+      "baseSchedulingEventId": "root",
+      "before": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "root", "dueAt": "2026-07-19T08:00:00+08:00", "intervalDays": 3, "repetitions": 1, "priorityPosition": 0},
+      "after": {"elementId": "other-item", "lifecycleState": "memorized", "adoptedTerminalEventId": "cross", "dueAt": "2026-07-23T14:00:00+08:00", "repetitions": 2}
+    },
+    {
+      "spec": 1,
+      "eventId": "cycle-a",
+      "occurredAt": "2026-07-19T15:00:00+08:00",
+      "type": "reviewElement",
+      "elementId": "20260719010101-abcdefg",
+      "baseSchedulingEventId": "cycle-b",
+      "before": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "cycle-b", "dueAt": "2026-07-24T16:00:00+08:00", "repetitions": 3},
+      "after": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "cycle-a", "dueAt": "2026-07-23T15:00:00+08:00", "repetitions": 2}
+    },
+    {
+      "spec": 1,
+      "eventId": "cycle-b",
+      "occurredAt": "2026-07-19T16:00:00+08:00",
+      "type": "reviewElement",
+      "elementId": "20260719010101-abcdefg",
+      "baseSchedulingEventId": "cycle-a",
+      "before": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "cycle-a", "dueAt": "2026-07-23T15:00:00+08:00", "repetitions": 2},
+      "after": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "cycle-b", "dueAt": "2026-07-24T16:00:00+08:00", "repetitions": 3}
+    },
+    {
+      "spec": 1,
+      "eventId": "incompatible",
+      "occurredAt": "2026-07-19T17:00:00+08:00",
+      "type": "reviewElement",
+      "elementId": "20260719010101-abcdefg",
+      "baseSchedulingEventId": "root",
+      "before": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "root", "dueAt": "2026-07-30T08:00:00+08:00", "intervalDays": 99, "repetitions": 1, "priorityPosition": 0},
+      "after": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "incompatible", "dueAt": "2026-08-01T17:00:00+08:00", "repetitions": 2}
+    },
+    {
+      "spec": 1,
+      "eventId": "conflict",
+      "occurredAt": "2026-07-19T18:00:00+08:00",
+      "type": "reviewElement",
+      "elementId": "20260719010101-abcdefg",
+      "baseSchedulingEventId": "root",
+      "before": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "root", "dueAt": "2026-07-19T08:00:00+08:00", "intervalDays": 3, "repetitions": 1, "priorityPosition": 0},
+      "after": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "conflict", "dueAt": "2026-07-25T18:00:00+08:00", "repetitions": 2}
+    },
+    {
+      "spec": 1,
+      "eventId": "conflict",
+      "occurredAt": "2026-07-19T19:00:00+08:00",
+      "type": "reviewElement",
+      "elementId": "20260719010101-abcdefg",
+      "baseSchedulingEventId": "root",
+      "before": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "root", "dueAt": "2026-07-19T08:00:00+08:00", "intervalDays": 3, "repetitions": 1, "priorityPosition": 0},
+      "after": {"elementId": "20260719010101-abcdefg", "lifecycleState": "memorized", "adoptedTerminalEventId": "conflict", "dueAt": "2026-07-26T19:00:00+08:00", "repetitions": 2}
+    }
+  ]
+}

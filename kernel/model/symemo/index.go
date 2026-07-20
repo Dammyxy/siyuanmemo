@@ -1,0 +1,300 @@
+// SiYuan - Refactor your thinking
+// Copyright (c) 2020-present, b3log.org
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+//go:build cgo
+
+package symemo
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"sync"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+const projectionSchemaVersion = 2
+
+var errProjectionNotFound = errors.New("projection not found")
+
+type projectionIndex struct {
+	path string
+	db   *sql.DB
+	mu   sync.RWMutex
+}
+
+func openProjectionIndex(path string) (*projectionIndex, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return nil, err
+	}
+	index := &projectionIndex{path: path}
+	if err := index.openAndValidate(); err != nil {
+		index.close()
+		removeSQLiteFiles(path)
+		if err = index.openFresh(); err != nil {
+			return nil, err
+		}
+	}
+	return index, nil
+}
+
+func (index *projectionIndex) openAndValidate() error {
+	if _, err := os.Stat(index.path); err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite3", index.path+"?_journal_mode=WAL&_busy_timeout=5000")
+	if err != nil {
+		return err
+	}
+	index.db = db
+	var health string
+	if err = db.QueryRow("PRAGMA quick_check").Scan(&health); err != nil || health != "ok" {
+		return fmt.Errorf("projection database health check failed: %s: %w", health, err)
+	}
+	var version string
+	if err = db.QueryRow("SELECT value FROM metadata WHERE key = 'schema_version'").Scan(&version); err != nil {
+		return err
+	}
+	if version != strconv.Itoa(projectionSchemaVersion) {
+		return fmt.Errorf("projection schema version %s is incompatible", version)
+	}
+	return nil
+}
+
+func (index *projectionIndex) openFresh() error {
+	db, err := sql.Open("sqlite3", index.path+"?_journal_mode=WAL&_busy_timeout=5000")
+	if err != nil {
+		return err
+	}
+	index.db = db
+	statements := []string{
+		"CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+		"CREATE TABLE elements (id TEXT PRIMARY KEY, source_json BLOB NOT NULL)",
+		"CREATE TABLE projections (element_id TEXT PRIMARY KEY, projection_json BLOB NOT NULL)",
+		"CREATE TABLE diagnostics (event_id TEXT NOT NULL, payload_hash TEXT NOT NULL, diagnostic_json BLOB NOT NULL, PRIMARY KEY(event_id, payload_hash))",
+		"CREATE TABLE source_diagnostics (source_path TEXT PRIMARY KEY, diagnostic_json BLOB NOT NULL)",
+		"INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
+	}
+	for i, statement := range statements {
+		if i == len(statements)-1 {
+			_, err = db.Exec(statement, strconv.Itoa(projectionSchemaVersion))
+		} else {
+			_, err = db.Exec(statement)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (index *projectionIndex) replaceAll(ctx context.Context, build projectionBuild) error {
+	index.mu.Lock()
+	defer index.mu.Unlock()
+	if index.db == nil {
+		return errors.New("projection database is closed")
+	}
+	tx, err := index.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, table := range []string{"elements", "projections", "diagnostics", "source_diagnostics"} {
+		if _, err = tx.Exec("DELETE FROM " + table); err != nil {
+			return err
+		}
+	}
+	ids := make([]string, 0, len(build.Elements))
+	for id := range build.Elements {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		data, marshalErr := json.Marshal(build.Elements[id])
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if _, err = tx.Exec("INSERT INTO elements(id, source_json) VALUES(?, ?)", id, data); err != nil {
+			return err
+		}
+	}
+	projectionIDs := make([]string, 0, len(build.Projections))
+	for id := range build.Projections {
+		projectionIDs = append(projectionIDs, id)
+	}
+	sort.Strings(projectionIDs)
+	for _, id := range projectionIDs {
+		data, marshalErr := json.Marshal(build.Projections[id])
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if _, err = tx.Exec("INSERT INTO projections(element_id, projection_json) VALUES(?, ?)", id, data); err != nil {
+			return err
+		}
+	}
+	for _, diagnostic := range build.EventDiagnostics {
+		data, marshalErr := json.Marshal(diagnostic)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if _, err = tx.Exec("INSERT INTO diagnostics(event_id, payload_hash, diagnostic_json) VALUES(?, ?, ?)", diagnostic.EventID, diagnostic.PayloadHash, data); err != nil {
+			return err
+		}
+	}
+	for _, diagnostic := range build.SourceDiagnostics {
+		data, marshalErr := json.Marshal(diagnostic)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if _, err = tx.Exec("INSERT INTO source_diagnostics(source_path, diagnostic_json) VALUES(?, ?)", diagnostic.SourcePath, data); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (index *projectionIndex) sourceDiagnostics() ([]ElementSourceDiagnostic, error) {
+	index.mu.RLock()
+	defer index.mu.RUnlock()
+	rows, err := index.db.Query("SELECT diagnostic_json FROM source_diagnostics ORDER BY source_path")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var diagnostics []ElementSourceDiagnostic
+	for rows.Next() {
+		var data []byte
+		if err = rows.Scan(&data); err != nil {
+			return nil, err
+		}
+		var diagnostic ElementSourceDiagnostic
+		if err = json.Unmarshal(data, &diagnostic); err != nil {
+			return nil, err
+		}
+		diagnostics = append(diagnostics, diagnostic)
+	}
+	return diagnostics, rows.Err()
+}
+
+func (index *projectionIndex) projection(elementID string) (SchedulingProjection, error) {
+	index.mu.RLock()
+	defer index.mu.RUnlock()
+	var data []byte
+	if err := index.db.QueryRow("SELECT projection_json FROM projections WHERE element_id = ?", elementID).Scan(&data); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SchedulingProjection{}, errProjectionNotFound
+		}
+		return SchedulingProjection{}, err
+	}
+	var projection SchedulingProjection
+	if err := json.Unmarshal(data, &projection); err != nil {
+		return SchedulingProjection{}, err
+	}
+	return projection, nil
+}
+
+func (index *projectionIndex) element(elementID string) (Element, error) {
+	index.mu.RLock()
+	defer index.mu.RUnlock()
+	var data []byte
+	if err := index.db.QueryRow("SELECT source_json FROM elements WHERE id = ?", elementID).Scan(&data); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Element{}, errProjectionNotFound
+		}
+		return Element{}, err
+	}
+	var element Element
+	if err := json.Unmarshal(data, &element); err != nil {
+		return Element{}, err
+	}
+	return element, nil
+}
+
+func (index *projectionIndex) dueTargets(now time.Time, learningDate string) ([]ReviewTarget, error) {
+	index.mu.RLock()
+	defer index.mu.RUnlock()
+	rows, err := index.db.Query("SELECT e.source_json, p.projection_json FROM elements e JOIN projections p ON p.element_id = e.id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var targets []ReviewTarget
+	for rows.Next() {
+		var elementData, projectionData []byte
+		if err = rows.Scan(&elementData, &projectionData); err != nil {
+			return nil, err
+		}
+		var element Element
+		var projection SchedulingProjection
+		if err = json.Unmarshal(elementData, &element); err != nil {
+			return nil, err
+		}
+		if err = json.Unmarshal(projectionData, &projection); err != nil {
+			return nil, err
+		}
+		if projection.LifecycleState != "memorized" || projection.DueAt.After(now) || projection.LastLearningDate == learningDate {
+			continue
+		}
+		targets = append(targets, ReviewTarget{
+			Kind:                        "element.item",
+			ElementID:                   element.ID,
+			Prompt:                      element.Payload.Prompt,
+			DueAt:                       projection.DueAt,
+			PriorityPosition:            projection.PriorityPosition,
+			ObservedBaseSchedulingEvent: projection.AdoptedTerminalID,
+			ObservedProjection:          projection,
+			LearningDate:                learningDate,
+		})
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		if !targets[i].DueAt.Equal(targets[j].DueAt) {
+			return targets[i].DueAt.Before(targets[j].DueAt)
+		}
+		if targets[i].PriorityPosition != targets[j].PriorityPosition {
+			return targets[i].PriorityPosition < targets[j].PriorityPosition
+		}
+		return targets[i].ElementID < targets[j].ElementID
+	})
+	return targets, nil
+}
+
+func (index *projectionIndex) close() error {
+	index.mu.Lock()
+	defer index.mu.Unlock()
+	if index.db == nil {
+		return nil
+	}
+	err := index.db.Close()
+	index.db = nil
+	return err
+}
+
+func removeSQLiteFiles(path string) {
+	_ = os.Remove(path)
+	_ = os.Remove(path + "-wal")
+	_ = os.Remove(path + "-shm")
+}

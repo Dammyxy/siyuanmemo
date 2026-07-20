@@ -1,0 +1,17 @@
+{
+  "spec": 1,
+  "id": "20260719010101-abcdefg",
+  "type": "item",
+  "title": "Prepared Q/A Item",
+  "processingState": "processed",
+  "createdAt": "2026-07-16T08:00:00+08:00",
+  "updatedAt": "2026-07-16T08:00:00+08:00",
+  "payloadSpec": 1,
+  "payload": {
+    "kind": "qa",
+    "prompt": "What is the source of scheduling truth?",
+    "answer": "Immutable monthly review events and versioned scheduler configuration."
+  },
+  "relations": [],
+  "children": []
+}

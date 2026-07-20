@@ -894,6 +894,9 @@ func Close(force, setCurrentWorkspace bool, execInstallPkg int) (exitCode int) {
 	}
 
 	Conf.Close()
+	if err := CloseSymemoEngine(); err != nil {
+		logging.LogErrorf("close SiYuanMemo Engine failed: %s", err)
+	}
 	// 退出前关闭已打开的加密笔记本并推送 closeBox，让前端关闭对应的明文文档标签页，避免重启后泄密。
 	// 走 Unmount：落盘 Closed=true + 生成历史 + 锁定清 DEK + 广播 closeBox。
 	// 排除用户指南：Unmount 对用户指南会触发 RemoveBox（mount.go:208-214）。
