@@ -19,9 +19,13 @@ package model
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -521,6 +525,226 @@ func TestInitSymemoWaitsBeforeBootstrapAndEngineOpen(t *testing.T) {
 	if opens != 1 || !config.LoadEffectiveSchedulerConfig().PersistedComplete {
 		t.Fatalf("opens=%d effective=%#v", opens, config.LoadEffectiveSchedulerConfig())
 	}
+}
+
+func TestSymemoServingEntrypointsPreserveRuntimeStartupBoundary(t *testing.T) {
+	entrypoints := []struct {
+		path string
+		body func(*testing.T, *ast.File) *ast.BlockStmt
+	}{
+		{path: filepath.Join("..", "mobile", "kernel.go"), body: func(t *testing.T, file *ast.File) *ast.BlockStmt {
+			return mustGoFunctionBody(t, file, "StartKernel")
+		}},
+		{path: filepath.Join("..", "harmony", "kernel.go"), body: func(t *testing.T, file *ast.File) *ast.BlockStmt {
+			return mustGoFunctionBody(t, file, "StartKernel")
+		}},
+		{path: filepath.Join("..", "cli", "cmd", "serve.go"), body: func(t *testing.T, file *ast.File) *ast.BlockStmt {
+			return mustCommandRunBody(t, file, "serveCmd")
+		}},
+	}
+	startupOrder := []string{
+		"model.BootSyncData",
+		"model.InitBoxes",
+		"model.InitSymemo",
+		"model.LoadFlashcards",
+		"util.SetBooted",
+	}
+	for _, entrypoint := range entrypoints {
+		file := parseGoTestFile(t, entrypoint.path)
+		calls := goCallNames(entrypoint.body(t, file))
+		assertGoCallOrder(t, entrypoint.path, calls, startupOrder)
+		if count := countGoCall(calls, "model.InitSymemo"); count != 1 {
+			t.Errorf("%s initializes SiYuanMemo %d times", entrypoint.path, count)
+		}
+	}
+
+	commandRoot := filepath.Join("..", "cli", "cmd")
+	entries, err := os.ReadDir(commandRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".go" || entry.Name() == "serve.go" || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		path := filepath.Join(commandRoot, entry.Name())
+		if countGoCall(goCallNames(parseGoTestFile(t, path)), "model.InitSymemo") != 0 {
+			t.Errorf("one-shot command %s initializes SiYuanMemo", path)
+		}
+	}
+
+	syncFile := parseGoTestFile(t, "sync.go")
+	if countGoCall(goCallNames(mustGoFunctionBody(t, syncFile, "BootSyncData")), "InitSymemo") != 0 {
+		t.Fatal("BootSyncData initializes SiYuanMemo")
+	}
+
+	runtimeFile := parseGoTestFile(t, "symemo_runtime.go")
+	initBody := mustGoFunctionBody(t, runtimeFile, "InitSymemo")
+	if !hasGoCallWithArgument(initBody, "initializeSymemo", "waitForSyncingStorages") {
+		t.Fatal("InitSymemo bypasses synchronized-storage waiting")
+	}
+	for _, declaration := range runtimeFile.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok && function.Name.IsExported() && goResultIncludesSymemoEngine(function.Type.Results) {
+			t.Errorf("model Runtime exposes a naked Engine through %s", function.Name.Name)
+		}
+	}
+	for _, imported := range runtimeFile.Imports {
+		for _, forbidden := range []string{"github.com/siyuan-note/riff", "github.com/siyuan-note/filelock", "kernel/filesys"} {
+			if strings.Contains(imported.Path.Value, forbidden) {
+				t.Errorf("model Runtime imports forbidden workflow or authoritative writer %q", forbidden)
+			}
+		}
+	}
+	for _, forbidden := range []string{"os.WriteFile", "filelock.WriteFile", "filesys.WriteTree"} {
+		if countGoCall(goCallNames(runtimeFile), forbidden) != 0 {
+			t.Errorf("model Runtime calls forbidden authoritative writer %s", forbidden)
+		}
+	}
+	if countGoCall(goCallNames(mustGoFunctionBody(t, runtimeFile, "loadSymemoBlockReference")), "loadTreeByBlockIDWithReindexInBoxGuarded") != 1 {
+		t.Fatal("production BlockReferenceReader does not retain the guarded native read/reindex path")
+	}
+}
+
+func parseGoTestFile(t *testing.T, path string) *ast.File {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return file
+}
+
+func mustGoFunctionBody(t *testing.T, file *ast.File, name string) *ast.BlockStmt {
+	t.Helper()
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok && function.Name.Name == name {
+			return function.Body
+		}
+	}
+	t.Fatalf("function %s not found", name)
+	return nil
+}
+
+func mustCommandRunBody(t *testing.T, file *ast.File, variable string) *ast.BlockStmt {
+	t.Helper()
+	for _, declaration := range file.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, specification := range general.Specs {
+			value, ok := specification.(*ast.ValueSpec)
+			if !ok || len(value.Names) != 1 || value.Names[0].Name != variable || len(value.Values) != 1 {
+				continue
+			}
+			address, ok := value.Values[0].(*ast.UnaryExpr)
+			if !ok {
+				continue
+			}
+			literal, ok := address.X.(*ast.CompositeLit)
+			if !ok {
+				continue
+			}
+			for _, element := range literal.Elts {
+				field, ok := element.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+				key, keyOK := field.Key.(*ast.Ident)
+				run, runOK := field.Value.(*ast.FuncLit)
+				if keyOK && runOK && key.Name == "Run" {
+					return run.Body
+				}
+			}
+		}
+	}
+	t.Fatalf("command %s Run function not found", variable)
+	return nil
+}
+
+func goCallNames(node ast.Node) []string {
+	var names []string
+	ast.Inspect(node, func(current ast.Node) bool {
+		if call, ok := current.(*ast.CallExpr); ok {
+			if name := goExpressionName(call.Fun); name != "" {
+				names = append(names, name)
+			}
+		}
+		return true
+	})
+	return names
+}
+
+func goExpressionName(expression ast.Expr) string {
+	switch value := expression.(type) {
+	case *ast.Ident:
+		return value.Name
+	case *ast.SelectorExpr:
+		prefix := goExpressionName(value.X)
+		if prefix == "" {
+			return value.Sel.Name
+		}
+		return prefix + "." + value.Sel.Name
+	case *ast.ParenExpr:
+		return goExpressionName(value.X)
+	}
+	return ""
+}
+
+func assertGoCallOrder(t *testing.T, path string, calls, expected []string) {
+	t.Helper()
+	next := 0
+	for _, call := range calls {
+		if next < len(expected) && call == expected[next] {
+			next++
+		}
+	}
+	if next != len(expected) {
+		t.Errorf("%s startup calls = %#v, missing ordered suffix %#v", path, calls, expected[next:])
+	}
+}
+
+func countGoCall(calls []string, expected string) int {
+	count := 0
+	for _, call := range calls {
+		if call == expected {
+			count++
+		}
+	}
+	return count
+}
+
+func hasGoCallWithArgument(node ast.Node, callName, argumentName string) bool {
+	found := false
+	ast.Inspect(node, func(current ast.Node) bool {
+		call, ok := current.(*ast.CallExpr)
+		if !ok || goExpressionName(call.Fun) != callName {
+			return true
+		}
+		for _, argument := range call.Args {
+			if goExpressionName(argument) == argumentName {
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+func goResultIncludesSymemoEngine(results *ast.FieldList) bool {
+	if results == nil {
+		return false
+	}
+	for _, field := range results.List {
+		pointer, ok := field.Type.(*ast.StarExpr)
+		if ok && goExpressionName(pointer.X) == "symemo.Engine" {
+			return true
+		}
+	}
+	return false
 }
 
 func assertSymemoRuntimeCode(t *testing.T, err error, expected symemo.ErrorCode) {

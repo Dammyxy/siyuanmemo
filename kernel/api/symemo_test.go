@@ -228,7 +228,7 @@ func TestSymemoHandlersRemainTransportOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := string(data)
-	for _, forbidden := range []string{"SchedulingLedger", "filelock.", "memo.db", "/api/symemo/executeCommand", "github.com/siyuan-note/riff", "GetSymemoEngine", "kernel-not-ready"} {
+	for _, forbidden := range []string{"SchedulingLedger", "filelock.", "memo.db", "/api/symemo/executeCommand", "github.com/siyuan-note/riff", "GetSymemoEngine", "kernel-not-ready", "*symemo.Engine", "symemo.NewEngine(", "model.InitSymemo("} {
 		if strings.Contains(source, forbidden) {
 			t.Errorf("transport adapter contains forbidden workflow dependency %q", forbidden)
 		}

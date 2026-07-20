@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -67,6 +68,78 @@ func TestElementSourceTypeNeutralEnvelopeAndBlockedMaterials(t *testing.T) {
 	}
 	if _, ok := scan.Elements[treeInvalidID]; !ok {
 		t.Fatal("invalid block reference excluded the referring Element")
+	}
+}
+
+func TestEngineConstructionAndReadQueriesPreserveAllAuthoritativePaths(t *testing.T) {
+	config := copyElementTreeFixtureWorkspace(t)
+	if err := os.RemoveAll(config.SchedulerRoot); err != nil {
+		t.Fatal(err)
+	}
+	nativePath := filepath.Join(t.TempDir(), "notebook", "20260720010101-rootaaa.sy")
+	for path, data := range map[string][]byte{
+		filepath.Join(config.StorageRoot, "assets", "material.bin"): []byte("asset-sentinel"),
+		nativePath: []byte("sy-sentinel"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := snapshotPaths(t, config.StorageRoot)
+	beforeNative, err := os.ReadFile(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	for _, query := range []Query{
+		{Kind: QueryElementTree, IncludeScheduleSummary: true},
+		{Kind: QueryElement, ElementID: treeFutureID},
+		{Kind: QueryElementSourceDiagnostics},
+	} {
+		if _, err = engine.Query(t.Context(), query); err != nil {
+			t.Fatalf("read query %s failed: %v", query.Kind, err)
+		}
+	}
+	if after := snapshotPaths(t, config.StorageRoot); !equalStringMaps(before, after) {
+		t.Fatalf("Engine construction or read query changed authoritative paths\nbefore=%#v\nafter=%#v", before, after)
+	}
+	if afterNative, readErr := os.ReadFile(nativePath); readErr != nil || string(afterNative) != string(beforeNative) {
+		t.Fatalf("Engine construction or read query changed native .sy authority: %q, err=%v", afterNative, readErr)
+	}
+	if _, statErr := os.Stat(config.SchedulerRoot); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("Engine construction or read query created scheduler directory: %v", statErr)
+	}
+}
+
+func TestAuthoritativeElementAndReviewIOUsesFilelock(t *testing.T) {
+	for _, file := range []string{"storage.go", "ledger.go"} {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := string(data)
+		for _, forbidden := range []string{"os.ReadFile(", "os.WriteFile("} {
+			if strings.Contains(source, forbidden) {
+				t.Errorf("%s bypasses filelock with %s", file, forbidden)
+			}
+		}
+		if !strings.Contains(source, "filelock.ReadFile(") {
+			t.Errorf("%s does not retain a filelock authoritative read", file)
+		}
+	}
+	storageSource, err := os.ReadFile("storage.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(storageSource), "filelock.WriteFile(") {
+		t.Fatal("scheduler bootstrap does not retain filelock safe writes")
 	}
 }
 
