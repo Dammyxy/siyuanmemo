@@ -50,11 +50,15 @@ var symemoSafeMessages = map[string]string{
 	string(symemo.ErrQueueAdvanceFailed):           "The review was saved, but the learning queue could not advance.",
 	string(symemo.ErrHistoryRequiresRepair):        "The review history requires repair.",
 	string(symemo.ErrElementNotFound):              "The Element was not found.",
+	string(symemo.ErrElementSourceUnavailable):     "The Element source is unavailable.",
+	string(symemo.ErrElementSourceAmbiguous):       "The Element source is ambiguous.",
 }
 
 func registerSymemoRoutes(ginServer *gin.Engine) {
 	ginServer.Handle("POST", "/api/symemo/getElementSubset", model.CheckAuth, model.CheckAdminRole, getSymemoElementSubset)
 	ginServer.Handle("POST", "/api/symemo/getElementTree", model.CheckAuth, model.CheckAdminRole, getSymemoElementTree)
+	ginServer.Handle("POST", "/api/symemo/getElement", model.CheckAuth, model.CheckAdminRole, getSymemoElement)
+	ginServer.Handle("POST", "/api/symemo/getElementSourceDiagnostics", model.CheckAuth, model.CheckAdminRole, getSymemoElementSourceDiagnostics)
 	ginServer.Handle("POST", "/api/symemo/startLearning", model.CheckAuth, model.CheckAdminRole, startSymemoLearning)
 	ginServer.Handle("POST", "/api/symemo/showAnswer", model.CheckAuth, model.CheckAdminRole, showSymemoAnswer)
 	ginServer.Handle("POST", "/api/symemo/gradeItem", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, gradeSymemoItem)
@@ -72,6 +76,11 @@ type symemoElementRequest struct {
 type symemoElementTreeRequest struct {
 	RootElementID          string `json:"rootElementId"`
 	IncludeScheduleSummary bool   `json:"includeScheduleSummary"`
+}
+
+type symemoElementDiagnosticsRequest struct {
+	ElementID  string `json:"elementId"`
+	SourcePath string `json:"sourcePath"`
 }
 
 type symemoGradeRequest struct {
@@ -114,6 +123,53 @@ func getSymemoElementTree(c *gin.Context) {
 		return
 	}
 	writeSymemoSuccess(c, result)
+}
+
+func getSymemoElement(c *gin.Context) {
+	var request symemoElementRequest
+	if !bindSymemoRequest(c, &request) {
+		return
+	}
+	engine, err := model.GetSymemoEngine()
+	if err != nil {
+		writeSymemoError(c, err)
+		return
+	}
+	result, err := engine.Query(c, symemo.Query{Kind: symemo.QueryElement, ElementID: request.ElementID})
+	if err != nil {
+		writeSymemoError(c, err)
+		return
+	}
+	writeSymemoSuccess(c, redactSymemoElementAnswer(result.Element))
+}
+
+func getSymemoElementSourceDiagnostics(c *gin.Context) {
+	var request symemoElementDiagnosticsRequest
+	if !bindSymemoRequest(c, &request) {
+		return
+	}
+	engine, err := model.GetSymemoEngine()
+	if err != nil {
+		writeSymemoError(c, err)
+		return
+	}
+	result, err := engine.Query(c, symemo.Query{Kind: symemo.QueryElementSourceDiagnostics, ElementID: request.ElementID, SourcePath: request.SourcePath})
+	if err != nil {
+		writeSymemoError(c, err)
+		return
+	}
+	writeSymemoSuccess(c, struct {
+		Diagnostics []symemo.ElementSourceDiagnostic `json:"diagnostics"`
+	}{Diagnostics: result.Diagnostics})
+}
+
+func redactSymemoElementAnswer(element *symemo.ElementReadView) *symemo.ElementReadView {
+	if element == nil || element.Type != "item" {
+		return element
+	}
+	redacted := *element
+	redacted.Payload.Answer = ""
+	return &redacted
 }
 
 func startSymemoLearning(c *gin.Context) {

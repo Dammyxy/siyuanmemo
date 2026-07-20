@@ -42,13 +42,9 @@ type Element struct {
 
 func (element Element) MarshalJSON() ([]byte, error) {
 	type elementAlias Element
-	payload := element.Payload.Raw
-	if isSupportedElementType(element.Type) || len(payload) == 0 {
-		var err error
-		payload, err = json.Marshal(element.Payload)
-		if err != nil {
-			return nil, err
-		}
+	payload, err := marshalElementPayload(element.Type, element.Payload)
+	if err != nil {
+		return nil, err
 	}
 	return json.Marshal(struct {
 		elementAlias
@@ -63,6 +59,13 @@ func isSupportedElementType(elementType string) bool {
 	default:
 		return false
 	}
+}
+
+func marshalElementPayload(elementType string, payload ElementPayload) (json.RawMessage, error) {
+	if !isSupportedElementType(elementType) && len(payload.Raw) > 0 {
+		return payload.Raw, nil
+	}
+	return json.Marshal(payload)
 }
 
 type ElementPayload struct {
@@ -181,6 +184,37 @@ type ElementTreeNode struct {
 	MaterialSourceDiagnostic *ElementMaterialDiagnostic `json:"materialSourceDiagnostic,omitempty"`
 	ScheduleSummary          *ElementScheduleSummary    `json:"scheduleSummary,omitempty"`
 	Children                 []ElementTreeNode          `json:"children,omitempty"`
+}
+
+type ElementEnvelope Element
+
+type ElementReadView struct {
+	ElementEnvelope
+	ParentElementID          string                     `json:"parentElementId,omitempty"`
+	RootElementID            string                     `json:"rootElementId"`
+	StorageKind              StorageKind                `json:"storageKind"`
+	SourcePath               string                     `json:"sourcePath"`
+	SourceMode               SourceMode                 `json:"sourceMode"`
+	SupportStatus            SupportStatus              `json:"supportStatus"`
+	BlockID                  string                     `json:"blockId,omitempty"`
+	SourceNotebookID         string                     `json:"sourceNotebookId,omitempty"`
+	CurrentNotebookID        string                     `json:"currentNotebookId,omitempty"`
+	CurrentPath              string                     `json:"currentPath,omitempty"`
+	MaterialSourceStatus     *MaterialSourceStatus      `json:"materialSourceStatus,omitempty"`
+	MaterialSourceDiagnostic *ElementMaterialDiagnostic `json:"materialSourceDiagnostic,omitempty"`
+	ScheduleProjection       *SchedulingProjection      `json:"scheduleProjection,omitempty"`
+}
+
+func (view ElementReadView) MarshalJSON() ([]byte, error) {
+	type viewAlias ElementReadView
+	payload, err := marshalElementPayload(view.Type, view.Payload)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(struct {
+		viewAlias
+		Payload json.RawMessage `json:"payload"`
+	}{viewAlias: viewAlias(view), Payload: payload})
 }
 
 type ElementScheduleSummary struct {
@@ -379,23 +413,29 @@ type LearningAction struct {
 type QueryKind string
 
 const (
-	QueryElementSubset  QueryKind = "GetElementSubset"
-	QueryCurrentSession QueryKind = "GetCurrentLearningSession"
-	QueryElementTree    QueryKind = "GetElementTree"
+	QueryElementSubset            QueryKind = "GetElementSubset"
+	QueryCurrentSession           QueryKind = "GetCurrentLearningSession"
+	QueryElementTree              QueryKind = "GetElementTree"
+	QueryElement                  QueryKind = "GetElement"
+	QueryElementSourceDiagnostics QueryKind = "GetElementSourceDiagnostics"
 )
 
 type Query struct {
 	Kind                   QueryKind `json:"kind"`
 	Subset                 string    `json:"subset,omitempty"`
 	RootElementID          string    `json:"rootElementId,omitempty"`
+	ElementID              string    `json:"elementId,omitempty"`
+	SourcePath             string    `json:"sourcePath,omitempty"`
 	IncludeScheduleSummary bool      `json:"includeScheduleSummary,omitempty"`
 }
 
 type QueryResult struct {
-	Subset  string                `json:"subset,omitempty"`
-	Items   []ReviewTargetSummary `json:"items,omitempty"`
-	Session *SessionState         `json:"session,omitempty"`
-	Nodes   []ElementTreeNode     `json:"nodes,omitempty"`
+	Subset      string                    `json:"subset,omitempty"`
+	Items       []ReviewTargetSummary     `json:"items,omitempty"`
+	Session     *SessionState             `json:"session,omitempty"`
+	Nodes       []ElementTreeNode         `json:"nodes,omitempty"`
+	Element     *ElementReadView          `json:"element,omitempty"`
+	Diagnostics []ElementSourceDiagnostic `json:"diagnostics,omitempty"`
 }
 
 type LearningResult struct {

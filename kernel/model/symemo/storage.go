@@ -710,6 +710,41 @@ func normalizeSourceDiagnostics(diagnostics []ElementSourceDiagnostic) []Element
 	return normalized
 }
 
+func filterSourceDiagnostics(diagnostics []ElementSourceDiagnostic, elementID, sourcePath string) []ElementSourceDiagnostic {
+	if sourcePath != "" {
+		sourcePath = filepath.ToSlash(filepath.Clean(sourcePath))
+	}
+	filtered := make([]ElementSourceDiagnostic, 0, len(diagnostics))
+	for _, diagnostic := range diagnostics {
+		if elementID != "" && diagnostic.ElementID != elementID {
+			continue
+		}
+		if sourcePath != "" && diagnostic.SourcePath != sourcePath {
+			continue
+		}
+		filtered = append(filtered, diagnostic)
+	}
+	return filtered
+}
+
+func diagnosedElementSourceCode(elementID string, diagnostics []ElementSourceDiagnostic) ErrorCode {
+	unavailable := false
+	for _, diagnostic := range diagnostics {
+		pathID := strings.TrimSuffix(filepath.Base(filepath.FromSlash(diagnostic.SourcePath)), ".sme")
+		if diagnostic.ElementID != elementID && pathID != elementID {
+			continue
+		}
+		if diagnostic.Code == sourceDuplicateCode {
+			return ErrElementSourceAmbiguous
+		}
+		unavailable = true
+	}
+	if unavailable {
+		return ErrElementSourceUnavailable
+	}
+	return ErrElementNotFound
+}
+
 func sameSourceDiagnosticKey(left, right ElementSourceDiagnostic) bool {
 	return left.SourcePath == right.SourcePath && left.Code == right.Code && left.ElementID == right.ElementID
 }

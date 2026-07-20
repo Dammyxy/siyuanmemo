@@ -18,6 +18,7 @@ package symemo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 )
@@ -103,6 +104,51 @@ func (engine *Engine) Query(ctx context.Context, query Query) (QueryResult, erro
 			return QueryResult{}, err
 		}
 		return QueryResult{Nodes: nodes}, nil
+	case QueryElement:
+		element, err := engine.index.element(query.ElementID)
+		if errors.Is(err, errProjectionNotFound) {
+			diagnostics, diagnosticsErr := engine.index.sourceDiagnostics()
+			if diagnosticsErr != nil {
+				return QueryResult{}, diagnosticsErr
+			}
+			switch diagnosedElementSourceCode(query.ElementID, diagnostics) {
+			case ErrElementSourceAmbiguous:
+				return QueryResult{}, domainError(ErrElementSourceAmbiguous, "Element source is ambiguous", nil)
+			case ErrElementSourceUnavailable:
+				return QueryResult{}, domainError(ErrElementSourceUnavailable, "Element source is unavailable", nil)
+			default:
+				return QueryResult{}, domainError(ErrElementNotFound, "Element was not found", nil)
+			}
+		}
+		if err != nil {
+			return QueryResult{}, err
+		}
+		nodes, err := engine.index.tree()
+		if err != nil {
+			return QueryResult{}, err
+		}
+		node, ok := projectedTreeNode(nodes, query.ElementID)
+		if !ok {
+			return QueryResult{}, errProjectionNotFound
+		}
+		view := elementReadView(element, node)
+		projection, projectionErr := engine.index.projection(query.ElementID)
+		if projectionErr == nil {
+			view.ScheduleProjection = &projection
+		} else if !errors.Is(projectionErr, errProjectionNotFound) {
+			return QueryResult{}, projectionErr
+		}
+		view, err = overlayElementBlockReference(ctx, engine.config.BlockReader, view)
+		if err != nil {
+			return QueryResult{}, err
+		}
+		return QueryResult{Element: &view}, nil
+	case QueryElementSourceDiagnostics:
+		diagnostics, err := engine.index.sourceDiagnostics()
+		if err != nil {
+			return QueryResult{}, err
+		}
+		return QueryResult{Diagnostics: filterSourceDiagnostics(diagnostics, query.ElementID, query.SourcePath)}, nil
 	default:
 		return QueryResult{}, domainError(ErrUnsupportedOperation, "unsupported Query variant", nil)
 	}

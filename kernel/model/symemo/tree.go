@@ -85,6 +85,59 @@ func treeNodeFromRecord(record elementSourceRecord, projection SchedulingProject
 	return node
 }
 
+func projectedTreeNode(nodes []ElementTreeNode, elementID string) (ElementTreeNode, bool) {
+	for _, node := range nodes {
+		if node.ElementID == elementID {
+			return node, true
+		}
+		if found, ok := projectedTreeNode(node.Children, elementID); ok {
+			return found, true
+		}
+	}
+	return ElementTreeNode{}, false
+}
+
+func elementReadView(element Element, node ElementTreeNode) ElementReadView {
+	return ElementReadView{
+		ElementEnvelope:          ElementEnvelope(element),
+		ParentElementID:          node.ParentElementID,
+		RootElementID:            node.RootElementID,
+		StorageKind:              node.StorageKind,
+		SourcePath:               node.SourcePath,
+		SourceMode:               node.SourceMode,
+		SupportStatus:            node.SupportStatus,
+		BlockID:                  node.BlockID,
+		SourceNotebookID:         node.SourceNotebookID,
+		CurrentNotebookID:        node.CurrentNotebookID,
+		CurrentPath:              node.CurrentPath,
+		MaterialSourceStatus:     node.MaterialSourceStatus,
+		MaterialSourceDiagnostic: node.MaterialSourceDiagnostic,
+	}
+}
+
+func overlayElementBlockReference(ctx context.Context, reader BlockReferenceReader, view ElementReadView) (ElementReadView, error) {
+	if view.BlockID == "" || view.MaterialSourceDiagnostic != nil {
+		return view, nil
+	}
+	resolution, err := reader.Load(ctx, view.BlockID)
+	if err != nil {
+		return ElementReadView{}, err
+	}
+	view.CurrentNotebookID = resolution.CurrentNotebookID
+	view.CurrentPath = resolution.CurrentPath
+	if resolution.Encrypted {
+		view.MaterialSourceStatus = nil
+		view.MaterialSourceDiagnostic = &ElementMaterialDiagnostic{Code: materialEncrypted, Reason: "Encrypted notebook sources are not supported."}
+		return view, nil
+	}
+	status := resolution.Status
+	if status != MaterialSourceAvailable && status != MaterialSourceUnavailable && status != MaterialSourceUnresolved {
+		status = MaterialSourceUnresolved
+	}
+	view.MaterialSourceStatus = &status
+	return view, nil
+}
+
 func sourceMode(element Element) SourceMode {
 	if element.Type == "topic" && element.Payload.Material != nil {
 		switch element.Payload.Material.Kind {

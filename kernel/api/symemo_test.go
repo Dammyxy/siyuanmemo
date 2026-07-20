@@ -39,12 +39,14 @@ func TestSymemoRoutes(t *testing.T) {
 	server := gin.New()
 	registerSymemoRoutes(server)
 	want := map[string]bool{
-		"POST /api/symemo/getElementSubset":          false,
-		"POST /api/symemo/getElementTree":            false,
-		"POST /api/symemo/startLearning":             false,
-		"POST /api/symemo/showAnswer":                false,
-		"POST /api/symemo/gradeItem":                 false,
-		"POST /api/symemo/getCurrentLearningSession": false,
+		"POST /api/symemo/getElementSubset":            false,
+		"POST /api/symemo/getElementTree":              false,
+		"POST /api/symemo/getElement":                  false,
+		"POST /api/symemo/getElementSourceDiagnostics": false,
+		"POST /api/symemo/startLearning":               false,
+		"POST /api/symemo/showAnswer":                  false,
+		"POST /api/symemo/gradeItem":                   false,
+		"POST /api/symemo/getCurrentLearningSession":   false,
 	}
 	for _, route := range server.Routes() {
 		key := route.Method + " " + route.Path
@@ -76,6 +78,8 @@ func TestSymemoHandlersRemainTransportOnly(t *testing.T) {
 	registrations := []string{
 		`ginServer.Handle("POST", "/api/symemo/getElementSubset", model.CheckAuth, model.CheckAdminRole, getSymemoElementSubset)`,
 		`ginServer.Handle("POST", "/api/symemo/getElementTree", model.CheckAuth, model.CheckAdminRole, getSymemoElementTree)`,
+		`ginServer.Handle("POST", "/api/symemo/getElement", model.CheckAuth, model.CheckAdminRole, getSymemoElement)`,
+		`ginServer.Handle("POST", "/api/symemo/getElementSourceDiagnostics", model.CheckAuth, model.CheckAdminRole, getSymemoElementSourceDiagnostics)`,
 		`ginServer.Handle("POST", "/api/symemo/startLearning", model.CheckAuth, model.CheckAdminRole, startSymemoLearning)`,
 		`ginServer.Handle("POST", "/api/symemo/showAnswer", model.CheckAuth, model.CheckAdminRole, showSymemoAnswer)`,
 		`ginServer.Handle("POST", "/api/symemo/gradeItem", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, gradeSymemoItem)`,
@@ -190,6 +194,69 @@ func TestSymemoElementTreeMissingScopedRootUsesStableDomainError(t *testing.T) {
 	assertSymemoFailure(t, response, "element-not-found", "The Element was not found.")
 	if len(*logs) != 0 {
 		t.Fatalf("missing scoped root logs=%#v", *logs)
+	}
+}
+
+func TestSymemoElementReadRoutes(t *testing.T) {
+	storageRoot := installSymemoFixtureWorkspace(t)
+	elementsRoot := filepath.Join(storageRoot, "elements")
+	unavailableID := "20260720030201-unavail"
+	if err := os.WriteFile(filepath.Join(elementsRoot, unavailableID+".sme"), []byte(`{"spec":1,"id":`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	duplicateID := "20260720010102-itemaaa"
+	duplicate := `{"spec":1,"id":"` + duplicateID + `","type":"item","processingState":"processed","payloadSpec":1,"payload":{"kind":"qa","prompt":"duplicate","answer":"hidden"},"children":[]}`
+	if err := os.WriteFile(filepath.Join(elementsRoot, duplicateID+".sme"), []byte(duplicate), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	known := invokeSymemoHandler(t, getSymemoElement, `{"elementId":"`+symemoFixtureElementID+`"}`)
+	if code := envelopeCode(t, known); code != 0 {
+		t.Fatalf("known Element response = %s", known.Body.String())
+	}
+	knownData := envelopeData(t, known)
+	if !strings.Contains(string(knownData), `"id":"`+symemoFixtureElementID+`"`) || !strings.Contains(string(knownData), `"supportStatus":"supported"`) || strings.Contains(string(knownData), `"answer"`) {
+		t.Fatalf("known Element response was malformed or revealed its answer: %s", knownData)
+	}
+
+	future := invokeSymemoHandler(t, getSymemoElement, `{"elementId":"20260720010106-futurex"}`)
+	futureData := envelopeData(t, future)
+	if code := envelopeCode(t, future); code != 0 || !strings.Contains(string(futureData), `"supportStatus":"unsupportedReadOnly"`) || !strings.Contains(string(futureData), `"kept":true`) {
+		t.Fatalf("future Element response = %s", future.Body.String())
+	}
+
+	invalid := invokeSymemoHandler(t, getSymemoElement, `{"elementId":"20260720010105-badblok"}`)
+	invalidData := envelopeData(t, invalid)
+	if code := envelopeCode(t, invalid); code != 0 || !strings.Contains(string(invalidData), `"code":"invalid-block-reference"`) || strings.Contains(string(invalidData), `"materialSourceStatus"`) {
+		t.Fatalf("invalid material Element response = %s", invalid.Body.String())
+	}
+
+	missing := invokeSymemoHandler(t, getSymemoElement, `{"elementId":"20260720999999-missing"}`)
+	assertSymemoFailure(t, missing, string(symemo.ErrElementNotFound), "The Element was not found.")
+	unavailable := invokeSymemoHandler(t, getSymemoElement, `{"elementId":"`+unavailableID+`"}`)
+	assertSymemoFailure(t, unavailable, string(symemo.ErrElementSourceUnavailable), "The Element source is unavailable.")
+	ambiguous := invokeSymemoHandler(t, getSymemoElement, `{"elementId":"`+duplicateID+`"}`)
+	assertSymemoFailure(t, ambiguous, string(symemo.ErrElementSourceAmbiguous), "The Element source is ambiguous.")
+}
+
+func TestSymemoElementDiagnosticRoutes(t *testing.T) {
+	storageRoot := installSymemoFixtureWorkspace(t)
+	elementsRoot := filepath.Join(storageRoot, "elements")
+	duplicateID := "20260720010102-itemaaa"
+	duplicate := `{"spec":1,"id":"` + duplicateID + `","type":"item","processingState":"processed","payloadSpec":1,"payload":{"kind":"qa","prompt":"duplicate","answer":"hidden"},"children":[]}`
+	if err := os.WriteFile(filepath.Join(elementsRoot, duplicateID+".sme"), []byte(duplicate), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	filtered := invokeSymemoHandler(t, getSymemoElementSourceDiagnostics, `{"elementId":"`+duplicateID+`"}`)
+	filteredData := envelopeData(t, filtered)
+	if code := envelopeCode(t, filtered); code != 0 || !strings.Contains(string(filteredData), `"code":"duplicate-element-id"`) || !strings.Contains(string(filteredData), `"relatedPaths"`) {
+		t.Fatalf("filtered diagnostics response = %s", filtered.Body.String())
+	}
+
+	none := invokeSymemoHandler(t, getSymemoElementSourceDiagnostics, `{"sourcePath":"../../outside.sme"}`)
+	if noneData := envelopeData(t, none); envelopeCode(t, none) != 0 || string(noneData) != `{"diagnostics":[]}` {
+		t.Fatalf("unmatched diagnostics response = %s", none.Body.String())
 	}
 }
 

@@ -541,7 +541,9 @@ func newElementTreeFixtureEngine(t *testing.T) (*Engine, *fakeBlockReferenceRead
 			},
 		},
 		loadResults: map[string]BlockReferenceResolution{
+			treeSourceBlock: {BlockID: treeSourceBlock, Status: MaterialSourceAvailable, CurrentNotebookID: "20260720000000-movednb", CurrentPath: "/moved/doc.sy"},
 			treeMissedBlock: {BlockID: treeMissedBlock, Status: MaterialSourceAvailable, CurrentNotebookID: "20260720000000-recover", CurrentPath: "/recovered/doc.sy"},
+			treeCryptoBlock: {BlockID: treeCryptoBlock, Status: MaterialSourceAvailable, CurrentNotebookID: "20260720000000-cryptnb", CurrentPath: "/encrypted/doc.sy", Encrypted: true},
 			treeAbsentBlock: {BlockID: treeAbsentBlock, Status: MaterialSourceUnavailable},
 			treeUnsureBlock: {BlockID: treeUnsureBlock, Status: MaterialSourceUnresolved},
 		},
