@@ -6,7 +6,7 @@ Date: 2026-07-19
 
 SiYuanMemo starts as a SiYuan-derived AGPL-3.0 project instead of a clean-room reimplementation.
 
-The project will reuse SiYuan's existing local kernel, desktop shell, block editor, block model, backlinks, indexing, and workspace foundations. SiYuanMemo's first major product addition is a SuperMemo-like progressive reading layer.
+The project will reuse SiYuan's existing local kernel, desktop shell, block editor, block model, backlinks, indexing, and workspace foundations. SiYuanMemo's first major product addition is a progressive reading and spaced repetition layer.
 
 ## Product Boundary
 
@@ -26,6 +26,7 @@ Initial development should preserve SiYuan's existing architecture and avoid ear
 - Keep the existing editor and backlink system intact while validating the fork.
 - Add Topic as a new module rather than forcing Topic into the existing block model.
 - Use existing block APIs when promoting Topic material into notes.
+- Store Elements with SiYuan-style root-document and internal-tree semantics: one root `.sme` per Element document, nested internal Elements, ID-named child-root directories, and rebuildable indexes.
 
 ## GitHub Fork Setup
 
