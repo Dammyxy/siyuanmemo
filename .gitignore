@@ -43,3 +43,11 @@ muslbin/
 
 # Workflows
 **/__pycache__
+
+# Local research/reference material. Keep these out of git.
+/.agents/
+/.specify/
+/references/
+/local-references/
+/local-notes/
+/docs/siyuanmemo-local/

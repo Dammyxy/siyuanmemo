@@ -1,0 +1,13 @@
+.git/
+.github/
+node_modules/
+app/node_modules/
+app/stage/build/
+kernel/tmp/
+coverage/
+*.log*
+.env*
+Dockerfile*
+.dockerignore
+*.test
+*.out
