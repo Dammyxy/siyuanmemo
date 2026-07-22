@@ -24,7 +24,84 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+func TestLearningDayBoundaryUsesLocalWallClockAcrossDST(t *testing.T) {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name     string
+		day      string
+		shift    int
+		boundary time.Time
+	}{
+		{name: "spring day after gap", day: "2026-03-08", shift: 4, boundary: time.Date(2026, time.March, 8, 4, 0, 0, 0, location)},
+		{name: "fall day after overlap", day: "2026-11-01", shift: 4, boundary: time.Date(2026, time.November, 1, 4, 0, 0, 0, location)},
+		{name: "boundary inside spring gap", day: "2026-03-08", shift: 2, boundary: time.Date(2026, time.March, 8, 3, 0, 0, 0, location)},
+		{name: "boundary at first fall occurrence", day: "2026-11-01", shift: 1, boundary: time.Date(2026, time.November, 1, 5, 0, 0, 0, time.UTC)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			effective := EffectiveSchedulerConfig{
+				LearningDay:         LearningDayConfigV1{Spec: 1, TimeZoneIANA: "America/New_York", MidnightShiftHours: test.shift},
+				LearningDayLocation: location,
+			}
+			boundary, err := effective.TimeForLearningDayID(test.day)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !boundary.Equal(test.boundary) {
+				t.Fatalf("boundary = %s, want %s", boundary, test.boundary)
+			}
+			previousDay := test.boundary.Add(-time.Nanosecond)
+			previousDate := test.boundary.In(location).AddDate(0, 0, -1).Format("2006-01-02")
+			if got := effective.ResolveLearningDayID(previousDay); got != previousDate {
+				t.Fatalf("day immediately before boundary = %s, want %s", got, previousDate)
+			}
+			if got := effective.ResolveLearningDayID(test.boundary); got != test.day {
+				t.Fatalf("day at boundary = %s, want %s", got, test.day)
+			}
+		})
+	}
+}
+
+func TestLearningDayConfigChangeDoesNotRewriteRecordedEventDay(t *testing.T) {
+	config := copyFixtureWorkspace(t)
+	installDailyLearningConfig(t, config, "UTC", 4)
+	reviewPath := filepath.Join(config.ReviewsRoot(), "2026-07.smr")
+	writeTestJSON(t, reviewPath, EventFile{Spec: 1, Month: "2026-07", Events: []SchedulingEvent{{
+		Spec:          1,
+		EventID:       "recorded-learning-day",
+		OccurredAt:    time.Date(2026, time.July, 20, 2, 0, 0, 0, time.UTC),
+		Type:          "reviewElement",
+		ElementID:     fixtureElementID,
+		LearningDate:  "2026-07-19",
+		LearningDayID: "2026-07-19",
+	}}})
+	before, err := os.ReadFile(reviewPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestJSON(t, filepath.Join(config.SchedulerRoot, "learning-day.json"), LearningDayConfigV1{Spec: 1, TimeZoneIANA: "Asia/Shanghai", MidnightShiftHours: 4})
+	effective := config.LoadEffectiveSchedulerConfig()
+	if got := effective.ResolveLearningDayID(time.Date(2026, time.July, 20, 2, 0, 0, 0, time.UTC)); got != "2026-07-20" {
+		t.Fatalf("future Learning Day = %s", got)
+	}
+	after, err := os.ReadFile(reviewPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("loading changed Learning Day configuration rewrote review authority")
+	}
+	events, err := config.LoadEventFiles()
+	if err != nil || len(events) != 1 || events[0].LearningDayID != "2026-07-19" || events[0].LearningDate != "2026-07-19" {
+		t.Fatalf("recorded Learning Day changed: %#v, err=%v", events, err)
+	}
+}
 
 func TestStorageFixtureValidation(t *testing.T) {
 	_, config := newFixtureEngine(t)
@@ -314,11 +391,14 @@ func TestBootstrapSchedulerConfigMissingOnlyAndReadOnlyBypass(t *testing.T) {
 	readOnly := config
 	readOnly.ReadOnly = true
 	missing := filepath.Join(readOnly.SchedulerRoot, "topic-afactor-v1.json")
+	if err = os.Remove(missing); err != nil {
+		t.Fatal(err)
+	}
 	if err = readOnly.BootstrapSchedulerConfig(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = os.Stat(missing); !os.IsNotExist(err) {
-		t.Fatalf("read-only bootstrap created optional config: %v", err)
+		t.Fatalf("read-only bootstrap created scheduler config: %v", err)
 	}
 }
 

@@ -59,3 +59,12 @@ func writeProjectionSchemaMismatch(t *testing.T, engine *Engine) {
 		t.Fatal(err)
 	}
 }
+
+func corruptProjectionPayload(t *testing.T, engine *Engine) {
+	t.Helper()
+	projection := engine.index.data.Projections[fixtureElementID]
+	projection.AlgorithmStates = map[string]VersionedAlgorithmState{
+		"corrupt": {Algorithm: "corrupt", SchemaVersion: 1, State: func() {}},
+	}
+	engine.index.data.Projections[fixtureElementID] = projection
+}

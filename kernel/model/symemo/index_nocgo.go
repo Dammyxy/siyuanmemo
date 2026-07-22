@@ -24,30 +24,39 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
-	"time"
 
 	"github.com/siyuan-note/filelock"
 )
 
-const projectionSchemaVersion = 3
+const projectionSchemaVersion = 6
 
 var errProjectionNotFound = errors.New("projection not found")
 
 type fileProjection struct {
-	SchemaVersion     int                             `json:"schemaVersion"`
-	Elements          map[string]Element              `json:"elements"`
-	Tree              []ElementTreeNode               `json:"tree"`
-	Projections       map[string]SchedulingProjection `json:"projections"`
-	Diagnostics       []EventDiagnostic               `json:"diagnostics"`
-	SourceDiagnostics []ElementSourceDiagnostic       `json:"sourceDiagnostics"`
+	SchemaVersion            int                             `json:"schemaVersion"`
+	Elements                 map[string]Element              `json:"elements"`
+	Tree                     []ElementTreeNode               `json:"tree"`
+	Projections              map[string]SchedulingProjection `json:"projections"`
+	FinalDrillProjections    map[string]FinalDrillProjection `json:"finalDrillProjections"`
+	HistoryEventFingerprints []string                        `json:"historyEventFingerprints"`
+	Diagnostics              []EventDiagnostic               `json:"diagnostics"`
+	SourceDiagnostics        []ElementSourceDiagnostic       `json:"sourceDiagnostics"`
 }
 
 type projectionIndex struct {
 	path string
 	mu   sync.RWMutex
 	data fileProjection
+}
+
+type projectionSnapshot struct {
+	Elements                 map[string]Element
+	Tree                     []ElementTreeNode
+	Projections              map[string]SchedulingProjection
+	FinalDrillProjections    map[string]FinalDrillProjection
+	HistoryEventFingerprints map[string]bool
+	BlockedElementIDs        map[string]bool
 }
 
 func openProjectionIndex(path string) (*projectionIndex, error) {
@@ -57,7 +66,7 @@ func openProjectionIndex(path string) (*projectionIndex, error) {
 	index := &projectionIndex{path: path, data: emptyFileProjection()}
 	data, err := os.ReadFile(path)
 	if err == nil {
-		if unmarshalErr := json.Unmarshal(data, &index.data); unmarshalErr != nil || index.data.SchemaVersion != projectionSchemaVersion || index.data.Elements == nil || index.data.Projections == nil {
+		if unmarshalErr := json.Unmarshal(data, &index.data); unmarshalErr != nil || index.data.SchemaVersion != projectionSchemaVersion || index.data.Elements == nil || index.data.Projections == nil || index.data.FinalDrillProjections == nil || index.data.HistoryEventFingerprints == nil {
 			index.data = emptyFileProjection()
 			if saveErr := index.saveLocked(); saveErr != nil {
 				return nil, saveErr
@@ -74,13 +83,13 @@ func openProjectionIndex(path string) (*projectionIndex, error) {
 }
 
 func emptyFileProjection() fileProjection {
-	return fileProjection{SchemaVersion: projectionSchemaVersion, Elements: map[string]Element{}, Tree: []ElementTreeNode{}, Projections: map[string]SchedulingProjection{}}
+	return fileProjection{SchemaVersion: projectionSchemaVersion, Elements: map[string]Element{}, Tree: []ElementTreeNode{}, Projections: map[string]SchedulingProjection{}, FinalDrillProjections: map[string]FinalDrillProjection{}, HistoryEventFingerprints: []string{}}
 }
 
 func (index *projectionIndex) replaceAll(_ context.Context, build projectionBuild) error {
 	index.mu.Lock()
 	defer index.mu.Unlock()
-	next := fileProjection{SchemaVersion: projectionSchemaVersion, Elements: build.Elements, Tree: build.Tree, Projections: build.Projections, Diagnostics: build.EventDiagnostics, SourceDiagnostics: build.SourceDiagnostics}
+	next := fileProjection{SchemaVersion: projectionSchemaVersion, Elements: build.Elements, Tree: build.Tree, Projections: build.Projections, FinalDrillProjections: build.FinalDrillProjections, HistoryEventFingerprints: append([]string{}, build.HistoryEventFingerprints...), Diagnostics: build.EventDiagnostics, SourceDiagnostics: build.SourceDiagnostics}
 	data, err := json.MarshalIndent(next, "", "  ")
 	if err != nil {
 		return err
@@ -126,6 +135,16 @@ func (index *projectionIndex) projection(elementID string) (SchedulingProjection
 	if !ok {
 		return SchedulingProjection{}, errProjectionNotFound
 	}
+	return cloneSchedulingProjection(projection)
+}
+
+func (index *projectionIndex) finalDrillProjection(elementID string) (FinalDrillProjection, error) {
+	index.mu.RLock()
+	defer index.mu.RUnlock()
+	projection, ok := index.data.FinalDrillProjections[elementID]
+	if !ok {
+		return FinalDrillProjection{}, errProjectionNotFound
+	}
 	return projection, nil
 }
 
@@ -139,27 +158,39 @@ func (index *projectionIndex) element(elementID string) (Element, error) {
 	return element, nil
 }
 
-func (index *projectionIndex) dueTargets(now time.Time, learningDate string) ([]ReviewTarget, error) {
+func (index *projectionIndex) snapshot() (projectionSnapshot, error) {
 	index.mu.RLock()
 	defer index.mu.RUnlock()
-	var targets []ReviewTarget
-	for id, projection := range index.data.Projections {
-		element, ok := index.data.Elements[id]
-		if !ok || !isSchedulableItem(element, projection) || projection.LifecycleState != "memorized" || projection.DueAt.After(now) || projection.LastLearningDate == learningDate {
-			continue
-		}
-		targets = append(targets, ReviewTarget{Kind: "element.item", ElementID: id, Prompt: element.Payload.Prompt, DueAt: projection.DueAt, PriorityPosition: projection.PriorityPosition, ObservedBaseSchedulingEvent: projection.AdoptedTerminalID, ObservedProjection: projection, LearningDate: learningDate})
+	snapshot := projectionSnapshot{
+		Elements:                 make(map[string]Element, len(index.data.Elements)),
+		Tree:                     append([]ElementTreeNode(nil), index.data.Tree...),
+		Projections:              make(map[string]SchedulingProjection, len(index.data.Projections)),
+		FinalDrillProjections:    make(map[string]FinalDrillProjection, len(index.data.FinalDrillProjections)),
+		HistoryEventFingerprints: make(map[string]bool, len(index.data.HistoryEventFingerprints)),
+		BlockedElementIDs:        make(map[string]bool),
 	}
-	sort.Slice(targets, func(i, j int) bool {
-		if !targets[i].DueAt.Equal(targets[j].DueAt) {
-			return targets[i].DueAt.Before(targets[j].DueAt)
+	for id, element := range index.data.Elements {
+		snapshot.Elements[id] = element
+	}
+	for id, projection := range index.data.Projections {
+		cloned, err := cloneSchedulingProjection(projection)
+		if err != nil {
+			return projectionSnapshot{}, err
 		}
-		if targets[i].PriorityPosition != targets[j].PriorityPosition {
-			return targets[i].PriorityPosition < targets[j].PriorityPosition
+		snapshot.Projections[id] = cloned
+	}
+	for id, projection := range index.data.FinalDrillProjections {
+		snapshot.FinalDrillProjections[id] = projection
+	}
+	for _, fingerprint := range index.data.HistoryEventFingerprints {
+		snapshot.HistoryEventFingerprints[fingerprint] = true
+	}
+	for _, diagnostic := range index.data.SourceDiagnostics {
+		if diagnostic.Code == schedulingHistoryUnavailableCode && diagnostic.ElementID != "" {
+			snapshot.BlockedElementIDs[diagnostic.ElementID] = true
 		}
-		return targets[i].ElementID < targets[j].ElementID
-	})
-	return targets, nil
+	}
+	return snapshot, nil
 }
 
 func (index *projectionIndex) close() error { return nil }

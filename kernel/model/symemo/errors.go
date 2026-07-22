@@ -24,21 +24,21 @@ import (
 type ErrorCode string
 
 const (
-	ErrUnsupportedOperation         ErrorCode = "unsupported-operation"
-	ErrInvalidSessionPhase          ErrorCode = "invalid-session-phase"
-	ErrTargetMismatch               ErrorCode = "target-mismatch"
-	ErrUnsupportedGrade             ErrorCode = "unsupported-grade"
-	ErrAuthoritativeItemUnavailable ErrorCode = "authoritative-item-unavailable"
-	ErrUnsupportedAlgorithmState    ErrorCode = "unsupported-algorithm-state"
-	ErrInvalidAlgorithmOutput       ErrorCode = "invalid-algorithm-output"
-	ErrDurableWriteFailed           ErrorCode = "durable-write-failed"
-	ErrProjectionRefreshFailed      ErrorCode = "projection-refresh-failed"
-	ErrQueueAdvanceFailed           ErrorCode = "queue-advance-failed"
-	ErrHistoryRequiresRepair        ErrorCode = "history-requires-repair"
-	ErrElementNotFound              ErrorCode = "element-not-found"
-	ErrElementSourceUnavailable     ErrorCode = "element-source-unavailable"
-	ErrElementSourceAmbiguous       ErrorCode = "element-source-ambiguous"
-	ErrProjectionRebuildFailed      ErrorCode = "projection-rebuild-failed"
+	ErrUnsupportedOperation            ErrorCode = "unsupported-operation"
+	ErrInvalidSessionPhase             ErrorCode = "invalid-session-phase"
+	ErrTargetMismatch                  ErrorCode = "target-mismatch"
+	ErrUnsupportedGrade                ErrorCode = "unsupported-grade"
+	ErrAuthoritativeElementUnavailable ErrorCode = "authoritative-element-unavailable"
+	ErrUnsupportedAlgorithmState       ErrorCode = "unsupported-algorithm-state"
+	ErrInvalidAlgorithmOutput          ErrorCode = "invalid-algorithm-output"
+	ErrDurableWriteFailed              ErrorCode = "durable-write-failed"
+	ErrProjectionRefreshFailed         ErrorCode = "projection-refresh-failed"
+	ErrQueueAdvanceFailed              ErrorCode = "queue-advance-failed"
+	ErrHistoryRequiresRepair           ErrorCode = "history-requires-repair"
+	ErrElementNotFound                 ErrorCode = "element-not-found"
+	ErrElementSourceUnavailable        ErrorCode = "element-source-unavailable"
+	ErrElementSourceAmbiguous          ErrorCode = "element-source-ambiguous"
+	ErrProjectionRebuildFailed         ErrorCode = "projection-rebuild-failed"
 )
 
 type DomainError struct {

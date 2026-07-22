@@ -18,13 +18,125 @@ package symemo
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"math/rand"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
 
+func TestTopicInitialIntervalUsesDeterministicRejectionSampling(t *testing.T) {
+	if got := topicInitialInterval("ff01"); got != 2 {
+		t.Fatalf("rejected 255 byte did not advance to the next byte: %d", got)
+	}
+	if got := topicInitialInterval(strings.Repeat("ff", sha256.Size)); got != 11 {
+		t.Fatalf("all-rejected seed did not expand deterministically: %d", got)
+	}
+	counts := [15]int{}
+	for value := 0; value < 255; value++ {
+		seed := hex.EncodeToString([]byte{byte(value)})
+		interval := topicInitialInterval(seed)
+		counts[interval-1]++
+		if replay := topicInitialInterval(seed); replay != interval {
+			t.Fatalf("seed %q replay = %d, want %d", seed, replay, interval)
+		}
+	}
+	for interval, count := range counts {
+		if count != 17 {
+			t.Fatalf("interval %d accepted-byte count = %d, want 17", interval+1, count)
+		}
+	}
+}
+
+func TestOutstandingPopulationIsStableAcrossTwentyPermutations(t *testing.T) {
+	config := copyFixtureWorkspace(t)
+	installDailyLearningConfig(t, config, "Asia/Shanghai", 4)
+	reader := &fakeBlockReferenceReader{lookupResults: map[string]BlockReferenceResolution{
+		"unavailable-block": {BlockID: "unavailable-block", Status: MaterialSourceUnavailable},
+	}}
+	config.BlockReader = reader
+	engine, err := NewEngine(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+
+	location := config.LoadEffectiveSchedulerConfig().LearningDayLocation
+	earlyDue := time.Date(2026, time.July, 17, 4, 0, 0, 0, location)
+	laterDue := time.Date(2026, time.July, 18, 4, 0, 0, 0, location)
+	type populationMember struct {
+		element    Element
+		projection SchedulingProjection
+		node       ElementTreeNode
+	}
+	item := func(id string) Element {
+		return Element{Spec: 1, ID: id, Type: "item", ProcessingState: "processed", PayloadSpec: 1, Payload: ItemPayload{Kind: "qa", Prompt: id, Answer: "answer"}}
+	}
+	topic := func(id string, material TopicMaterial) Element {
+		return Element{Spec: 1, ID: id, Type: "topic", Title: id, ProcessingState: "reading", PayloadSpec: 1, Payload: ElementPayload{Material: &material}}
+	}
+	projection := func(id string, dueAt time.Time, dueDay, lifecycle string, priority float64) SchedulingProjection {
+		return SchedulingProjection{ElementID: id, ScheduleProfile: fsrsV1ID, AcceptedReviewAction: "GradeItem", LifecycleState: lifecycle, DueAt: dueAt, DueLearningDay: dueDay, PriorityPosition: priority}
+	}
+	topicProjection := func(id string, dueAt time.Time, dueDay string, priority float64) SchedulingProjection {
+		return SchedulingProjection{
+			ElementID:            id,
+			ScheduleProfile:      topicAFactorV1ID,
+			AcceptedReviewAction: "NextTopic",
+			LifecycleState:       "memorized",
+			DueAt:                dueAt,
+			DueLearningDay:       dueDay,
+			PriorityPosition:     priority,
+			ActiveAlgorithm:      topicAFactorV1ID,
+			AlgorithmStates: map[string]VersionedAlgorithmState{topicAFactorV1ID: {
+				Algorithm:     topicAFactorV1ID,
+				SchemaVersion: 1,
+				State:         TopicAFactorV1State{IntervalDays: 1, Repetitions: 1, LastLearningDay: "2026-07-17", DueLearningDay: dueDay, EffectiveAFactor: 2.5},
+			}},
+		}
+	}
+	members := []populationMember{
+		{element: item("eligible-early"), projection: projection("eligible-early", earlyDue, "2026-07-17", "memorized", 9), node: ElementTreeNode{ElementID: "eligible-early"}},
+		{element: item("eligible-priority"), projection: projection("eligible-priority", laterDue, "2026-07-18", "memorized", 1), node: ElementTreeNode{ElementID: "eligible-priority"}},
+		{element: topic("eligible-topic", TopicMaterial{Kind: "html", HTML: "<p>topic</p>"}), projection: topicProjection("eligible-topic", laterDue, "2026-07-18", 2), node: ElementTreeNode{ElementID: "eligible-topic"}},
+		{element: item("future-item"), projection: projection("future-item", laterDue.AddDate(0, 0, 2), "2026-07-20", "memorized", 0), node: ElementTreeNode{ElementID: "future-item"}},
+		{element: item("dismissed-item"), projection: projection("dismissed-item", earlyDue, "2026-07-17", "dismissed", 0), node: ElementTreeNode{ElementID: "dismissed-item"}},
+		{element: Element{Spec: 1, ID: "unsupported-concept", Type: "concept", ProcessingState: "reading", PayloadSpec: 1}, projection: projection("unsupported-concept", earlyDue, "2026-07-17", "memorized", 0), node: ElementTreeNode{ElementID: "unsupported-concept"}},
+		{element: topic("unavailable-topic", TopicMaterial{Kind: "siyuanBlock", BlockID: "unavailable-block"}), projection: topicProjection("unavailable-topic", earlyDue, "2026-07-17", 0), node: ElementTreeNode{ElementID: "unavailable-topic", SourceMode: SourceModeBlock, BlockID: "unavailable-block"}},
+		{element: item("same-day-item"), projection: SchedulingProjection{ElementID: "same-day-item", ScheduleProfile: fsrsV1ID, AcceptedReviewAction: "GradeItem", LifecycleState: "memorized", DueAt: earlyDue, DueLearningDay: "2026-07-17", LastLearningDate: "2026-07-19"}, node: ElementTreeNode{ElementID: "same-day-item"}},
+	}
+	want := []string{"eligible-early", "eligible-priority", "eligible-topic"}
+	for permutation := 0; permutation < 20; permutation++ {
+		order := rand.New(rand.NewSource(int64(permutation + 1))).Perm(len(members))
+		build := projectionBuild{Elements: map[string]Element{}, Projections: map[string]SchedulingProjection{}}
+		for _, memberIndex := range order {
+			member := members[memberIndex]
+			build.Elements[member.element.ID] = member.element
+			build.Projections[member.projection.ElementID] = member.projection
+			build.Tree = append(build.Tree, member.node)
+		}
+		if err = engine.index.replaceAll(t.Context(), build); err != nil {
+			t.Fatal(err)
+		}
+		plan, planErr := engine.scheduler.BuildLearningPlan(t.Context())
+		if planErr != nil {
+			t.Fatal(planErr)
+		}
+		got := make([]string, len(plan.Outstanding))
+		for i, target := range plan.Outstanding {
+			got[i] = target.ElementID
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("permutation %d Outstanding = %#v, want %#v", permutation, got, want)
+		}
+	}
+}
+
 func TestSchedulerDueOnlyAndSameDayExclusion(t *testing.T) {
 	engine, _ := newFixtureEngine(t)
-	targets, err := engine.scheduler.BuildQueue()
+	targets, err := engine.scheduler.BuildQueue(t.Context())
 	if err != nil || len(targets) != 1 {
 		t.Fatalf("targets=%#v err=%v", targets, err)
 	}
@@ -33,7 +145,7 @@ func TestSchedulerDueOnlyAndSameDayExclusion(t *testing.T) {
 	if err = engine.index.replaceAll(context.Background(), projectionBuild{Elements: map[string]Element{fixtureElementID: mustElement(t, engine)}, Projections: map[string]SchedulingProjection{fixtureElementID: projection}}); err != nil {
 		t.Fatal(err)
 	}
-	targets, err = engine.scheduler.BuildQueue()
+	targets, err = engine.scheduler.BuildQueue(t.Context())
 	if err != nil || len(targets) != 0 {
 		t.Fatalf("same-day targets=%#v err=%v", targets, err)
 	}
@@ -59,7 +171,7 @@ func TestSchedulerDueOrdering(t *testing.T) {
 	if err := engine.index.replaceAll(context.Background(), projectionBuild{Elements: elements, Projections: projections}); err != nil {
 		t.Fatal(err)
 	}
-	targets, err := engine.scheduler.BuildQueue()
+	targets, err := engine.scheduler.BuildQueue(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}

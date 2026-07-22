@@ -73,6 +73,46 @@ func copyFixtureWorkspace(t *testing.T) Config {
 	}
 }
 
+func moveLegacyItemIntroductionDue(t *testing.T, event *SchedulingEvent, dueAt time.Time) {
+	t.Helper()
+	event.After.DueAt = dueAt
+	event.After.DueLearningDay = ""
+	alignLegacyItemIntroductionState(t, event)
+}
+
+func alignLegacyItemIntroductionState(t *testing.T, event *SchedulingEvent) {
+	t.Helper()
+	event.Before.ElementID = event.ElementID
+	event.Before.LifecycleState = "pending"
+	if !event.Before.DueAt.IsZero() {
+		event.Before.DueAt = event.OccurredAt
+	}
+	event.After.ElementID = event.ElementID
+	event.After.AdoptedTerminalID = event.EventID
+	event.After.LastReviewAt = timePointer(event.OccurredAt)
+	event.After.LastLearningDate = event.OccurredAt.Format("2006-01-02")
+	fsrsState, err := decodeAlgorithmState[FSRSV1State](event.After.AlgorithmStates[fsrsV1ID], fsrsV1ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fsrsState.DueAt = event.After.DueAt
+	fsrsState.ScheduledDays = uint64(event.After.IntervalDays)
+	fsrsState.Repetitions = uint64(event.After.Repetitions)
+	fsrsState.Lapses = uint64(event.After.Lapses)
+	fsrsState.LastReviewAt = event.OccurredAt
+	event.After.AlgorithmStates[fsrsV1ID] = VersionedAlgorithmState{Algorithm: fsrsV1ID, SchemaVersion: 1, State: fsrsState}
+	simpleState, err := decodeAlgorithmState[SimpleV1State](event.After.AlgorithmStates[simpleV1ID], simpleV1ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	simpleState.DueAt = timePointer(event.After.DueAt)
+	simpleState.IntervalDays = event.After.IntervalDays
+	simpleState.Repetitions = event.After.Repetitions
+	simpleState.Lapses = event.After.Lapses
+	simpleState.LastReviewAt = timePointer(event.OccurredAt)
+	event.After.AlgorithmStates[simpleV1ID] = VersionedAlgorithmState{Algorithm: simpleV1ID, SchemaVersion: 1, State: simpleState}
+}
+
 func skipBaselineFixturePath(relative string) bool {
 	relative = filepath.ToSlash(relative)
 	if relative == "." || relative == "elements" {
@@ -97,7 +137,7 @@ func newFixtureEngine(t *testing.T) (*Engine, Config) {
 	if err := os.MkdirAll(config.SchedulerRoot, 0755); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"collection.json", "simple-v1.json", "fsrs-v1.json", "arena-v1.json"} {
+	for _, name := range []string{"collection.json", "simple-v1.json", "fsrs-v1.json", "topic-afactor-v1.json", "arena-v1.json", "learning-day.json"} {
 		data, err := os.ReadFile(filepath.Join("testdata", "scheduler", name))
 		if err != nil {
 			t.Fatal(err)
@@ -117,6 +157,8 @@ func newFixtureEngine(t *testing.T) (*Engine, Config) {
 type fakeBlockReferenceReader struct {
 	lookupResults map[string]BlockReferenceResolution
 	loadResults   map[string]BlockReferenceResolution
+	lookupErr     error
+	loadErr       error
 	lookupCalls   int
 	loadCalls     int
 	lookupIDs     []string
@@ -126,6 +168,9 @@ type fakeBlockReferenceReader struct {
 func (reader *fakeBlockReferenceReader) LookupMany(_ context.Context, blockIDs []string) (map[string]BlockReferenceResolution, error) {
 	reader.lookupCalls++
 	reader.lookupIDs = append(reader.lookupIDs, blockIDs...)
+	if reader.lookupErr != nil {
+		return nil, reader.lookupErr
+	}
 	resolved := make(map[string]BlockReferenceResolution, len(blockIDs))
 	for _, id := range blockIDs {
 		if resolution, ok := reader.lookupResults[id]; ok {
@@ -140,6 +185,9 @@ func (reader *fakeBlockReferenceReader) LookupMany(_ context.Context, blockIDs [
 func (reader *fakeBlockReferenceReader) Load(_ context.Context, blockID string) (BlockReferenceResolution, error) {
 	reader.loadCalls++
 	reader.loadIDs = append(reader.loadIDs, blockID)
+	if reader.loadErr != nil {
+		return BlockReferenceResolution{}, reader.loadErr
+	}
 	if resolution, ok := reader.loadResults[blockID]; ok {
 		return resolution, nil
 	}

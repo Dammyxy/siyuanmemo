@@ -2136,6 +2136,7 @@
 		"321": "Access to encrypted notebook data is not supported via this API",
 		"322": "Şifreli not defteri [%s] hareketsizlik nedeniyle otomatik olarak kilitlendi",
 		"323": "Şifreli not defterleri devre dışı bırakılamıyor: silinen defterlerin geçmişi hâlâ geçerli anahtar yedeğine bağlı. Önce bu geçmişi temizleyin",
-		"324": "Şifreli not defterleri etkinken bir anahtar yedeği içe aktarılamaz. Önce devre dışı bırakın"
+		"324": "Şifreli not defterleri etkinken bir anahtar yedeği içe aktarılamaz. Önce devre dışı bırakın",
+		"325": "Öğrenme öğesi kullanılamıyor."
 	}
 	}

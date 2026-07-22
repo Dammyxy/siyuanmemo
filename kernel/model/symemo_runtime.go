@@ -49,6 +49,7 @@ type symemoRuntime struct {
 	open            func(context.Context) (*symemo.Engine, error)
 	waitForStorages func()
 	waitGeneration  uint64
+	rebuilding      bool
 }
 
 func newSymemoRuntime(open func(context.Context) (*symemo.Engine, error)) *symemoRuntime {
@@ -72,6 +73,17 @@ func (runtime *symemoRuntime) setStorageWaiter(waitForStorages func()) {
 	runtime.waitForStorages = waitForStorages
 	runtime.waitGeneration++
 	runtime.mu.Unlock()
+}
+
+func (runtime *symemoRuntime) beginSyncDrain() {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.state != symemoRuntimeAvailable || runtime.draining {
+		return
+	}
+	runtime.draining = true
+	runtime.state = symemoRuntimeUnavailable
+	runtime.failure = nil
 }
 
 func (runtime *symemoRuntime) latchFailure(err error) {
@@ -266,9 +278,14 @@ func (reader *siyuanBlockReferenceReader) Load(ctx context.Context, blockID stri
 
 func (runtime *symemoRuntime) rebuild(ctx context.Context) error {
 	runtime.mu.Lock()
-	for runtime.draining {
+	if runtime.state == symemoRuntimeUninitialized {
+		runtime.mu.Unlock()
+		return errSymemoRuntimeUninitialized
+	}
+	for runtime.rebuilding {
 		runtime.cond.Wait()
 	}
+	runtime.rebuilding = true
 	runtime.draining = true
 	runtime.state = symemoRuntimeUnavailable
 	for runtime.active > 0 {
@@ -300,6 +317,7 @@ func (runtime *symemoRuntime) finishRebuild(engine *symemo.Engine, err error) {
 		runtime.state = symemoRuntimeAvailable
 	}
 	runtime.draining = false
+	runtime.rebuilding = false
 	runtime.cond.Broadcast()
 	runtime.mu.Unlock()
 }

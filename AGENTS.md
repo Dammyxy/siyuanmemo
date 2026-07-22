@@ -127,6 +127,11 @@ Four webpack configs each emit a separate bundle to `app/stage/build/{app,deskto
    - **NEVER** run `git commit` / `git push` unless explicitly asked — no exceptions
    - When you do commit, follow the style of recent commits (gitmoji prefix + subject, in English)
    - Append the full issue/PR URL (e.g. `https://github.com/siyuan-note/siyuan/issues/<NNN>`, not the `#NNN` short form — it is clickable) only when a related issue exists; do not fabricate one
+8. **Verification scope:**
+   - A failing test is diagnostic evidence, not authorization to change unrelated production code
+   - Reproduce unexpected failures at the feature's fixed baseline before remediation; if the same failure exists at baseline and is outside the approved plan, report it and use only the documented exclusion
+   - Fixing an out-of-scope baseline failure requires explicit user approval and separate traceability through an amended scope, maintenance task, or independently reviewable change
+   - Do not broaden a feature merely to make a repository-wide test matrix green
 
 ---
 

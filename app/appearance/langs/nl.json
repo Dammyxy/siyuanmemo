@@ -2136,6 +2136,7 @@
 		"321": "Access to encrypted notebook data is not supported via this API",
 		"322": "Versleuteld notitieboek [%s] is automatisch vergrendeld wegens inactiviteit",
 		"323": "Kan versleutelde notitieboeken niet uitschakelen: de geschiedenis van verwijderde notitieboeken is nog afhankelijk van de huidige sleutelback-up. Wis die geschiedenis eerst",
-		"324": "Kan geen sleutelback-up importeren terwijl versleutelde notitieboeken zijn ingeschakeld. Schakel ze eerst uit"
+		"324": "Kan geen sleutelback-up importeren terwijl versleutelde notitieboeken zijn ingeschakeld. Schakel ze eerst uit",
+		"325": "Het leerelement is niet beschikbaar."
 	}
 	}

@@ -38,7 +38,7 @@ func TestEngineContractClosedVariants(t *testing.T) {
 	if _, err := engine.Query(context.Background(), Query{Kind: QueryElementSubset, Subset: "all"}); !hasCode(err, ErrUnsupportedOperation) {
 		t.Fatalf("Query error = %v", err)
 	}
-	if _, err := engine.RunLearningAction(context.Background(), LearningAction{Kind: LearningActionKind("Stop")}); !hasCode(err, ErrUnsupportedOperation) {
+	if _, err := engine.RunLearningAction(context.Background(), LearningAction{Kind: LearningActionKind("UnsupportedAction")}); !hasCode(err, ErrUnsupportedOperation) {
 		t.Fatalf("RunLearningAction error = %v", err)
 	}
 }
@@ -49,7 +49,7 @@ func TestEngineContractErrorCodesAreStableAndDistinct(t *testing.T) {
 		ErrInvalidSessionPhase,
 		ErrTargetMismatch,
 		ErrUnsupportedGrade,
-		ErrAuthoritativeItemUnavailable,
+		ErrAuthoritativeElementUnavailable,
 		ErrUnsupportedAlgorithmState,
 		ErrInvalidAlgorithmOutput,
 		ErrDurableWriteFailed,
@@ -71,7 +71,7 @@ func TestEngineContractErrorCodesAreStableAndDistinct(t *testing.T) {
 	}
 }
 
-func TestEngineContractExcludesUnavailableAuthoritativeItem(t *testing.T) {
+func TestEngineContractExcludesUnavailableAuthoritativeElement(t *testing.T) {
 	config := copyFixtureWorkspace(t)
 	path := filepath.Join(config.ElementsRoot(), fixtureElementID+".sme")
 	data, err := os.ReadFile(path)

@@ -232,15 +232,18 @@ type Relation struct {
 }
 
 type ReviewTarget struct {
-	Kind                        string               `json:"kind"`
-	ElementID                   string               `json:"elementId"`
-	Prompt                      string               `json:"prompt"`
-	Answer                      string               `json:"answer,omitempty"`
-	DueAt                       time.Time            `json:"dueAt"`
-	PriorityPosition            float64              `json:"priorityPosition"`
-	ObservedBaseSchedulingEvent string               `json:"observedBaseSchedulingEventId,omitempty"`
-	ObservedProjection          SchedulingProjection `json:"observedProjection"`
-	LearningDate                string               `json:"learningDate"`
+	Kind                         string               `json:"kind"`
+	ElementID                    string               `json:"elementId"`
+	Prompt                       string               `json:"prompt"`
+	Answer                       string               `json:"answer,omitempty"`
+	DueAt                        time.Time            `json:"dueAt"`
+	DueLearningDay               string               `json:"dueLearningDay,omitempty"`
+	PriorityPosition             float64              `json:"priorityPosition"`
+	ObservedBaseSchedulingEvent  string               `json:"observedBaseSchedulingEventId,omitempty"`
+	ObservedProjection           SchedulingProjection `json:"observedProjection"`
+	ObservedFinalDrillProjection FinalDrillProjection `json:"observedFinalDrillProjection,omitempty"`
+	LearningDate                 string               `json:"learningDate"`
+	LearningDayID                string               `json:"learningDayId,omitempty"`
 }
 
 type ReviewTargetSummary struct {
@@ -248,7 +251,9 @@ type ReviewTargetSummary struct {
 	ElementID        string    `json:"elementId"`
 	Prompt           string    `json:"prompt"`
 	DueAt            time.Time `json:"dueAt"`
+	DueLearningDay   string    `json:"dueLearningDay,omitempty"`
 	PriorityPosition float64   `json:"priorityPosition"`
+	LearningDayID    string    `json:"learningDayId,omitempty"`
 }
 
 type SessionStatus string
@@ -261,19 +266,37 @@ const (
 type SessionPhase string
 
 const (
-	PhaseQuestion SessionPhase = "question"
-	PhaseAnswer   SessionPhase = "answer"
-	PhaseComplete SessionPhase = "completed"
+	PhaseQuestion     SessionPhase = "question"
+	PhaseAnswer       SessionPhase = "answer"
+	PhaseConfirmation SessionPhase = "confirmation"
+	PhaseComplete     SessionPhase = "completed"
 )
 
+type LearningStage string
+
+const (
+	StageOutstanding LearningStage = "outstanding"
+	StagePending     LearningStage = "pending"
+	StageFinalDrill  LearningStage = "finalDrill"
+	StageCompleted   LearningStage = "completed"
+)
+
+type StageConfirmation struct {
+	Stage LearningStage `json:"stage"`
+}
+
 type SessionState struct {
-	SessionID              string                `json:"sessionId,omitempty"`
-	Status                 SessionStatus         `json:"status"`
-	Phase                  SessionPhase          `json:"phase"`
-	Current                *ReviewTarget         `json:"current,omitempty"`
-	RemainingElementIDs    []string              `json:"remainingElementIds,omitempty"`
-	LastProjection         *SchedulingProjection `json:"lastProjection,omitempty"`
-	PendingAcceptedEventID string                `json:"pendingAcceptedEventId,omitempty"`
+	SessionID                string                `json:"sessionId,omitempty"`
+	Status                   SessionStatus         `json:"status"`
+	Stage                    LearningStage         `json:"stage,omitempty"`
+	Phase                    SessionPhase          `json:"phase"`
+	Current                  *ReviewTarget         `json:"current,omitempty"`
+	RemainingElementIDs      []string              `json:"remainingElementIds,omitempty"`
+	Confirmation             *StageConfirmation    `json:"confirmation,omitempty"`
+	AnswerVisible            bool                  `json:"answerVisible"`
+	LastProjection           *SchedulingProjection `json:"lastProjection,omitempty"`
+	LastFinalDrillProjection *FinalDrillProjection `json:"lastFinalDrillProjection,omitempty"`
+	PendingAcceptedEventID   string                `json:"pendingAcceptedEventId,omitempty"`
 }
 
 type GradeLabel string
@@ -287,12 +310,15 @@ const (
 
 type NormalizedReview struct {
 	ElementID                   string     `json:"elementId"`
+	TargetKind                  string     `json:"targetKind,omitempty"`
+	ActionKind                  string     `json:"actionKind,omitempty"`
 	RawGrade                    int        `json:"rawGrade"`
 	Passed                      bool       `json:"passed"`
 	RatingLabel                 GradeLabel `json:"ratingLabel"`
 	RatingMapping               string     `json:"ratingMapping"`
 	ReviewAt                    time.Time  `json:"reviewAt"`
 	LearningDate                string     `json:"learningDate"`
+	LearningDayID               string     `json:"learningDayId,omitempty"`
 	SessionID                   string     `json:"sessionId"`
 	EventID                     string     `json:"eventId"`
 	ObservedBaseSchedulingEvent string     `json:"observedBaseSchedulingEventId,omitempty"`
@@ -333,6 +359,7 @@ type SchedulingProjection struct {
 	LifecycleState       string                             `json:"lifecycleState"`
 	AdoptedTerminalID    string                             `json:"adoptedTerminalEventId,omitempty"`
 	DueAt                time.Time                          `json:"dueAt"`
+	DueLearningDay       string                             `json:"dueLearningDay,omitempty"`
 	IntervalDays         int                                `json:"intervalDays"`
 	Repetitions          int                                `json:"repetitions"`
 	Lapses               int                                `json:"lapses"`
@@ -345,24 +372,58 @@ type SchedulingProjection struct {
 	PriorityPosition     float64                            `json:"priorityPosition"`
 }
 
+type FinalDrillProjection struct {
+	ElementID              string `json:"elementId"`
+	Member                 bool   `json:"member"`
+	LastActivityDay        string `json:"lastActivityDay,omitempty"`
+	AdmissionEventID       string `json:"admissionEventId,omitempty"`
+	AdoptedTerminalEventID string `json:"adoptedTerminalEventId,omitempty"`
+	Expired                bool   `json:"expired,omitempty"`
+}
+
+func cloneSchedulingProjection(projection SchedulingProjection) (SchedulingProjection, error) {
+	data, err := json.Marshal(projection)
+	if err != nil {
+		return SchedulingProjection{}, err
+	}
+	var cloned SchedulingProjection
+	if err = json.Unmarshal(data, &cloned); err != nil {
+		return SchedulingProjection{}, err
+	}
+	return cloned, nil
+}
+
 type SchedulingEvent struct {
-	Spec                int                  `json:"spec"`
-	EventID             string               `json:"eventId"`
-	OccurredAt          time.Time            `json:"occurredAt"`
-	Type                string               `json:"type"`
-	ElementID           string               `json:"elementId"`
-	SessionID           string               `json:"sessionId,omitempty"`
-	BaseEventID         string               `json:"baseSchedulingEventId,omitempty"`
-	ReviewKind          string               `json:"reviewKind,omitempty"`
-	RawGrade            *int                 `json:"rawGrade,omitempty"`
-	Passed              *bool                `json:"passed,omitempty"`
-	RatingLabel         GradeLabel           `json:"ratingLabel,omitempty"`
-	RatingMapping       string               `json:"ratingMapping,omitempty"`
-	LearningDate        string               `json:"learningDate,omitempty"`
-	AlgorithmDecision   AlgorithmDecision    `json:"algorithmDecision,omitempty"`
-	AlgorithmCandidates []AlgorithmCandidate `json:"algorithmCandidates,omitempty"`
-	Before              SchedulingProjection `json:"before"`
-	After               SchedulingProjection `json:"after"`
+	Spec                      int                  `json:"spec"`
+	EventID                   string               `json:"eventId"`
+	OccurredAt                time.Time            `json:"occurredAt"`
+	Type                      string               `json:"type"`
+	ElementID                 string               `json:"elementId"`
+	SessionID                 string               `json:"sessionId,omitempty"`
+	BaseEventID               string               `json:"baseSchedulingEventId,omitempty"`
+	ReviewKind                string               `json:"reviewKind,omitempty"`
+	RawGrade                  *int                 `json:"rawGrade,omitempty"`
+	Passed                    *bool                `json:"passed,omitempty"`
+	RatingLabel               GradeLabel           `json:"ratingLabel,omitempty"`
+	RatingMapping             string               `json:"ratingMapping,omitempty"`
+	LearningDate              string               `json:"learningDate,omitempty"`
+	LearningDayID             string               `json:"learningDayId,omitempty"`
+	TopicPolicyVersion        string               `json:"topicPolicyVersion,omitempty"`
+	TopicInitialIntervalDays  int                  `json:"topicInitialIntervalDays,omitempty"`
+	TopicPreviousIntervalDays int                  `json:"topicPreviousIntervalDays,omitempty"`
+	TopicEffectiveAFactor     float64              `json:"topicEffectiveAFactor,omitempty"`
+	TopicNextIntervalDays     int                  `json:"topicNextIntervalDays,omitempty"`
+	TopicMinimumIntervalDays  int                  `json:"topicMinimumIntervalDays,omitempty"`
+	TopicMaximumIntervalDays  int                  `json:"topicMaximumIntervalDays,omitempty"`
+	TopicSkipPolicy           string               `json:"topicSkipPolicy,omitempty"`
+	TopicSeed                 string               `json:"topicSeed,omitempty"`
+	DrillEffect               string               `json:"drillEffect,omitempty"`
+	DrillAdmissionEventID     string               `json:"drillAdmissionEventId,omitempty"`
+	BaseDrillEventID          string               `json:"baseDrillEventId,omitempty"`
+	AlgorithmDecision         AlgorithmDecision    `json:"algorithmDecision,omitempty"`
+	AlgorithmCandidates       []AlgorithmCandidate `json:"algorithmCandidates,omitempty"`
+	Before                    SchedulingProjection `json:"before"`
+	After                     SchedulingProjection `json:"after"`
 }
 
 type EventFile struct {
@@ -388,19 +449,26 @@ type ElementSourceDiagnostic struct {
 }
 
 type projectionBuild struct {
-	Elements          map[string]Element
-	Tree              []ElementTreeNode
-	Projections       map[string]SchedulingProjection
-	EventDiagnostics  []EventDiagnostic
-	SourceDiagnostics []ElementSourceDiagnostic
+	Elements                 map[string]Element
+	Tree                     []ElementTreeNode
+	Projections              map[string]SchedulingProjection
+	FinalDrillProjections    map[string]FinalDrillProjection
+	HistoryEventFingerprints []string
+	EventDiagnostics         []EventDiagnostic
+	SourceDiagnostics        []ElementSourceDiagnostic
 }
 
 type LearningActionKind string
 
 const (
-	ActionStart      LearningActionKind = "Start"
-	ActionShowAnswer LearningActionKind = "ShowAnswer"
-	ActionGradeItem  LearningActionKind = "GradeItem"
+	ActionStart                  LearningActionKind = "Start"
+	ActionShowAnswer             LearningActionKind = "ShowAnswer"
+	ActionGradeItem              LearningActionKind = "GradeItem"
+	ActionNextTopic              LearningActionKind = "NextTopic"
+	ActionAcceptStageTransition  LearningActionKind = "AcceptStageTransition"
+	ActionDeclineStageTransition LearningActionKind = "DeclineStageTransition"
+	ActionGradeDrill             LearningActionKind = "GradeDrill"
+	ActionStop                   LearningActionKind = "Stop"
 )
 
 type LearningAction struct {
@@ -408,6 +476,7 @@ type LearningAction struct {
 	ElementID string             `json:"elementId,omitempty"`
 	RawGrade  *int               `json:"rawGrade,omitempty"`
 	EventID   string             `json:"eventId,omitempty"`
+	Stage     LearningStage      `json:"stage,omitempty"`
 }
 
 type QueryKind string
@@ -439,16 +508,17 @@ type QueryResult struct {
 }
 
 type LearningResult struct {
-	ReviewAccepted bool                  `json:"reviewAccepted"`
-	EventID        string                `json:"eventId,omitempty"`
-	RawGrade       *int                  `json:"rawGrade,omitempty"`
-	Passed         *bool                 `json:"passed,omitempty"`
-	RatingLabel    GradeLabel            `json:"ratingLabel,omitempty"`
-	RatingMapping  string                `json:"ratingMapping,omitempty"`
-	Decision       *AlgorithmDecision    `json:"algorithmDecision,omitempty"`
-	Candidates     []AlgorithmCandidate  `json:"algorithmCandidates,omitempty"`
-	Projection     *SchedulingProjection `json:"projection,omitempty"`
-	Session        *SessionState         `json:"session,omitempty"`
+	ReviewAccepted       bool                  `json:"reviewAccepted"`
+	EventID              string                `json:"eventId,omitempty"`
+	RawGrade             *int                  `json:"rawGrade,omitempty"`
+	Passed               *bool                 `json:"passed,omitempty"`
+	RatingLabel          GradeLabel            `json:"ratingLabel,omitempty"`
+	RatingMapping        string                `json:"ratingMapping,omitempty"`
+	Decision             *AlgorithmDecision    `json:"algorithmDecision,omitempty"`
+	Candidates           []AlgorithmCandidate  `json:"algorithmCandidates,omitempty"`
+	Projection           *SchedulingProjection `json:"projection,omitempty"`
+	FinalDrillProjection *FinalDrillProjection `json:"finalDrillProjection,omitempty"`
+	Session              *SessionState         `json:"session,omitempty"`
 }
 
 type CreateElementCommand struct{ Kind string }

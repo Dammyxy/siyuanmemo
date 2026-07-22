@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync/atomic"
 )
 
@@ -88,13 +89,13 @@ func (engine *Engine) Query(ctx context.Context, query Query) (QueryResult, erro
 		if query.Subset != "due" {
 			return QueryResult{}, domainError(ErrUnsupportedOperation, "only the due Element subset is available", nil)
 		}
-		targets, err := engine.scheduler.BuildQueue()
+		targets, err := engine.scheduler.BuildQueue(ctx)
 		if err != nil {
 			return QueryResult{}, err
 		}
 		items := make([]ReviewTargetSummary, 0, len(targets))
 		for _, target := range targets {
-			items = append(items, ReviewTargetSummary{Kind: target.Kind, ElementID: target.ElementID, Prompt: target.Prompt, DueAt: target.DueAt, PriorityPosition: target.PriorityPosition})
+			items = append(items, ReviewTargetSummary{Kind: target.Kind, ElementID: target.ElementID, Prompt: target.Prompt, DueAt: target.DueAt, DueLearningDay: target.DueLearningDay, PriorityPosition: target.PriorityPosition, LearningDayID: target.LearningDayID})
 		}
 		return QueryResult{Subset: "due", Items: items}, nil
 	case QueryCurrentSession:
@@ -174,7 +175,7 @@ func (engine *Engine) RunLearningAction(ctx context.Context, action LearningActi
 	}
 	switch action.Kind {
 	case ActionStart:
-		state, err := engine.session.Start()
+		state, err := engine.session.Start(ctx)
 		return LearningResult{Session: &state}, err
 	case ActionShowAnswer:
 		state, err := engine.session.ShowAnswer(action.ElementID)
@@ -191,6 +192,36 @@ func (engine *Engine) RunLearningAction(ctx context.Context, action LearningActi
 			engine.unavailable.Store(true)
 		}
 		return result, err
+	case ActionNextTopic:
+		if !engine.schedulerConfigIsCurrent() {
+			return LearningResult{}, domainError(ErrHistoryRequiresRepair, "scheduler configuration requires repair", nil)
+		}
+		result, err := engine.session.NextTopic(ctx, action.ElementID, action.EventID)
+		if domainErr, ok := AsDomainError(err); ok && domainErr.Code == ErrProjectionRefreshFailed {
+			engine.unavailable.Store(true)
+		}
+		return result, err
+	case ActionAcceptStageTransition:
+		state, err := engine.session.AcceptStage(ctx, action.Stage)
+		return LearningResult{Session: &state}, err
+	case ActionDeclineStageTransition:
+		state, err := engine.session.DeclineStage(ctx, action.Stage)
+		return LearningResult{Session: &state}, err
+	case ActionGradeDrill:
+		if action.RawGrade == nil {
+			return LearningResult{}, domainError(ErrUnsupportedGrade, "raw grade is required", nil)
+		}
+		if !engine.schedulerConfigIsCurrent() {
+			return LearningResult{}, domainError(ErrHistoryRequiresRepair, "scheduler configuration requires repair", nil)
+		}
+		result, err := engine.session.GradeDrill(ctx, action.ElementID, action.EventID, *action.RawGrade)
+		if domainErr, ok := AsDomainError(err); ok && domainErr.Code == ErrProjectionRefreshFailed {
+			engine.unavailable.Store(true)
+		}
+		return result, err
+	case ActionStop:
+		state := engine.session.Stop()
+		return LearningResult{Session: &state}, nil
 	default:
 		return LearningResult{}, domainError(ErrUnsupportedOperation, "unsupported RunLearningAction variant", nil)
 	}
@@ -210,7 +241,7 @@ func projectionRebuildFailedError() error {
 }
 
 func isSchedulingChangingAction(kind LearningActionKind) bool {
-	return kind == ActionGradeItem
+	return kind == ActionGradeItem || kind == ActionNextTopic || kind == ActionGradeDrill
 }
 
 func (engine *Engine) refreshProjection(ctx context.Context) error {
@@ -222,26 +253,55 @@ func (engine *Engine) refreshProjection(ctx context.Context) error {
 }
 
 func (engine *Engine) refreshProjectionWithConfig(ctx context.Context, effectiveConfig EffectiveSchedulerConfig) error {
+	previous, err := engine.index.snapshot()
+	if err != nil {
+		previous = projectionSnapshot{Projections: map[string]SchedulingProjection{}, FinalDrillProjections: map[string]FinalDrillProjection{}}
+	}
 	scheduling, err := engine.ledger.Refresh(ctx)
 	if err != nil {
 		return err
+	}
+	for elementID, projection := range previous.Projections {
+		terminalMissing := projection.AdoptedTerminalID != "" && !scheduling.HistoryEventIDs[projection.AdoptedTerminalID]
+		if terminalMissing || (projection.AdoptedTerminalID != "" && !scheduling.HistoryElementIDs[elementID]) {
+			return domainError(ErrHistoryRequiresRepair, "required raw scheduling history is missing", nil)
+		}
+	}
+	for _, projection := range previous.FinalDrillProjections {
+		admissionMissing := projection.AdmissionEventID != "" && !scheduling.HistoryEventIDs[projection.AdmissionEventID]
+		terminalMissing := projection.AdoptedTerminalEventID != "" && !scheduling.HistoryEventIDs[projection.AdoptedTerminalEventID]
+		if admissionMissing || terminalMissing {
+			return domainError(ErrHistoryRequiresRepair, "required raw Final Drill history is missing", nil)
+		}
+	}
+	for fingerprint := range previous.HistoryEventFingerprints {
+		if !scheduling.HistoryEventFingerprints[fingerprint] {
+			return domainError(ErrHistoryRequiresRepair, "required raw scheduling history is missing", nil)
+		}
 	}
 	elementScan, err := engine.config.scanElements()
 	if err != nil {
 		return err
 	}
-	sourceDiagnostics := sourceDiagnosticsWithMissingProjections(elementScan, scheduling.Projections)
+	sourceDiagnostics := sourceDiagnosticsWithMissingProjections(elementScan, scheduling.Projections, scheduling.HistoryElementIDs)
 	if scheduling.HasEvents {
 		sourceDiagnostics = append(sourceDiagnostics, effectiveConfig.Diagnostics...)
 	}
 	sourceDiagnostics = normalizeSourceDiagnostics(sourceDiagnostics)
 	tree := buildElementTree(elementScan.Records, scheduling.Projections, true)
+	historyEventFingerprints := make([]string, 0, len(scheduling.HistoryEventFingerprints))
+	for fingerprint := range scheduling.HistoryEventFingerprints {
+		historyEventFingerprints = append(historyEventFingerprints, fingerprint)
+	}
+	sort.Strings(historyEventFingerprints)
 	return engine.index.replaceAll(ctx, projectionBuild{
-		Elements:          elementScan.Elements,
-		Tree:              tree,
-		Projections:       scheduling.Projections,
-		EventDiagnostics:  scheduling.EventDiagnostics,
-		SourceDiagnostics: sourceDiagnostics,
+		Elements:                 elementScan.Elements,
+		Tree:                     tree,
+		Projections:              scheduling.Projections,
+		FinalDrillProjections:    scheduling.FinalDrillProjections,
+		HistoryEventFingerprints: historyEventFingerprints,
+		EventDiagnostics:         scheduling.EventDiagnostics,
+		SourceDiagnostics:        sourceDiagnostics,
 	})
 }
 

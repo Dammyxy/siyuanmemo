@@ -70,8 +70,11 @@ type SchedulerConfig struct {
 	EnabledAlgorithms   []string  `json:"enabledAlgorithms,omitempty"`
 	Fallback            string    `json:"fallback,omitempty"`
 	IntervalRule        string    `json:"intervalRule,omitempty"`
+	AFactor             float64   `json:"aFactor,omitempty"`
+	MinimumIntervalDays int       `json:"minimumIntervalDays,omitempty"`
 	RequestRetention    float64   `json:"requestRetention,omitempty"`
 	MaximumIntervalDays int       `json:"maximumIntervalDays,omitempty"`
+	SkipPolicy          string    `json:"skipPolicy,omitempty"`
 	Weights             []float64 `json:"weights,omitempty"`
 	EnableShortTerm     bool      `json:"enableShortTerm,omitempty"`
 	EnableFuzz          bool      `json:"enableFuzz,omitempty"`
@@ -93,10 +96,19 @@ func (c Config) LoadSchedulerConfig(name string) (SchedulerConfig, error) {
 	return cfg, nil
 }
 
+type LearningDayConfigV1 struct {
+	Spec               int    `json:"spec"`
+	TimeZoneIANA       string `json:"timeZoneIana"`
+	MidnightShiftHours int    `json:"midnightShiftHours"`
+}
+
 type EffectiveSchedulerConfig struct {
-	FSRS              SchedulerConfig
-	PersistedComplete bool
-	Diagnostics       []ElementSourceDiagnostic
+	FSRS                SchedulerConfig
+	Topic               SchedulerConfig
+	LearningDay         LearningDayConfigV1
+	LearningDayLocation *time.Location
+	PersistedComplete   bool
+	Diagnostics         []ElementSourceDiagnostic
 }
 
 func defaultSchedulerConfigs() map[string]SchedulerConfig {
@@ -113,6 +125,14 @@ func defaultSchedulerConfigs() map[string]SchedulerConfig {
 			IntervalRule: "item-simple-v1",
 		},
 		"fsrs-v1": defaultFSRSV1SchedulerConfig(),
+		"topic-afactor-v1": {
+			Spec:                SupportedConfigSpec,
+			Algorithm:           topicAFactorV1ID,
+			AFactor:             2.5,
+			MinimumIntervalDays: 1,
+			MaximumIntervalDays: 36500,
+			SkipPolicy:          "none",
+		},
 		"arena-v1": {
 			Spec:              SupportedConfigSpec,
 			Primary:           fsrsV1ID,
@@ -123,12 +143,35 @@ func defaultSchedulerConfigs() map[string]SchedulerConfig {
 }
 
 func schedulerConfigNames() []string {
-	return []string{"collection", "simple-v1", "fsrs-v1", "arena-v1"}
+	return []string{"collection", "simple-v1", "fsrs-v1", "topic-afactor-v1", "arena-v1"}
+}
+
+func defaultLearningDayConfig() LearningDayConfigV1 {
+	return LearningDayConfigV1{Spec: SupportedConfigSpec, TimeZoneIANA: "UTC", MidnightShiftHours: 4}
+}
+
+func (c Config) LoadLearningDayConfig() (LearningDayConfigV1, error) {
+	path := filepath.Join(c.SchedulerRoot, "learning-day.json")
+	data, err := filelock.ReadFile(path)
+	if err != nil {
+		return LearningDayConfigV1{}, err
+	}
+	var cfg LearningDayConfigV1
+	if err = json.Unmarshal(data, &cfg); err != nil {
+		return LearningDayConfigV1{}, fmt.Errorf("decode learning day config: %w", err)
+	}
+	if cfg.Spec != SupportedConfigSpec {
+		return LearningDayConfigV1{}, fmt.Errorf("unsupported learning day config spec %d", cfg.Spec)
+	}
+	return cfg, nil
 }
 
 func (c Config) LoadEffectiveSchedulerConfig() EffectiveSchedulerConfig {
 	defaults := defaultSchedulerConfigs()
-	effective := EffectiveSchedulerConfig{FSRS: defaults["fsrs-v1"], PersistedComplete: true}
+	builtins := defaultSchedulerConfigs()
+	learningDayConfig := defaultLearningDayConfig()
+	learningDayLocation, _ := time.LoadLocation(learningDayConfig.TimeZoneIANA)
+	effective := EffectiveSchedulerConfig{FSRS: defaults["fsrs-v1"], Topic: defaults["topic-afactor-v1"], LearningDay: learningDayConfig, LearningDayLocation: learningDayLocation, PersistedComplete: true}
 	for _, name := range schedulerConfigNames() {
 		config, err := c.LoadSchedulerConfig(name)
 		if err != nil {
@@ -148,6 +191,30 @@ func (c Config) LoadEffectiveSchedulerConfig() EffectiveSchedulerConfig {
 		}
 		defaults[name] = config
 	}
+	learningDay, learningDayErr := c.LoadLearningDayConfig()
+	if learningDayErr != nil {
+		effective.PersistedComplete = false
+		code := "invalid-scheduler-config"
+		reason := "Learning Day configuration is invalid."
+		if errors.Is(learningDayErr, os.ErrNotExist) {
+			code = "missing-scheduler-config"
+			reason = "Learning Day configuration is missing."
+		}
+		effective.Diagnostics = append(effective.Diagnostics, ElementSourceDiagnostic{
+			SourcePath: filepath.ToSlash(filepath.Join("scheduler", "learning-day.json")),
+			Code:       code,
+			Reason:     reason,
+		})
+	} else {
+		learningDayConfig = learningDay
+	}
+	learningDayLocation, locationErr := time.LoadLocation(learningDayConfig.TimeZoneIANA)
+	if locationErr != nil || learningDayConfig.MidnightShiftHours < 0 || learningDayConfig.MidnightShiftHours > 16 {
+		effective.PersistedComplete = false
+		effective.Diagnostics = append(effective.Diagnostics, ElementSourceDiagnostic{SourcePath: filepath.ToSlash(filepath.Join("scheduler", "learning-day.json")), Code: "invalid-scheduler-config", Reason: "Learning Day configuration is invalid."})
+		learningDayConfig = defaultLearningDayConfig()
+		learningDayLocation, _ = time.LoadLocation(learningDayConfig.TimeZoneIANA)
+	}
 	if defaults["collection"].Primary != fsrsV1ID || defaults["collection"].Fallback != simpleV1ID {
 		effective.PersistedComplete = false
 		effective.Diagnostics = append(effective.Diagnostics, ElementSourceDiagnostic{SourcePath: filepath.ToSlash(filepath.Join("scheduler", "collection.json")), Code: "invalid-scheduler-config", Reason: "Scheduler configuration is invalid."})
@@ -162,11 +229,20 @@ func (c Config) LoadEffectiveSchedulerConfig() EffectiveSchedulerConfig {
 		effective.Diagnostics = append(effective.Diagnostics, ElementSourceDiagnostic{SourcePath: filepath.ToSlash(filepath.Join("scheduler", "fsrs-v1.json")), Code: "invalid-scheduler-config", Reason: "Scheduler configuration is invalid."})
 		fsrsConfig = defaultFSRSV1SchedulerConfig()
 	}
+	topicConfig := defaults["topic-afactor-v1"]
+	if topicConfig.Algorithm != topicAFactorV1ID || topicConfig.AFactor <= 0 || topicConfig.MinimumIntervalDays < 1 || topicConfig.MaximumIntervalDays < topicConfig.MinimumIntervalDays || (topicConfig.SkipPolicy != "" && topicConfig.SkipPolicy != "none") {
+		effective.PersistedComplete = false
+		effective.Diagnostics = append(effective.Diagnostics, ElementSourceDiagnostic{SourcePath: filepath.ToSlash(filepath.Join("scheduler", "topic-afactor-v1.json")), Code: "invalid-scheduler-config", Reason: "Scheduler configuration is invalid."})
+		topicConfig = builtins["topic-afactor-v1"]
+	}
 	if defaults["arena-v1"].Primary != fsrsV1ID || defaults["arena-v1"].Fallback != simpleV1ID {
 		effective.PersistedComplete = false
 		effective.Diagnostics = append(effective.Diagnostics, ElementSourceDiagnostic{SourcePath: filepath.ToSlash(filepath.Join("scheduler", "arena-v1.json")), Code: "invalid-scheduler-config", Reason: "Scheduler configuration is invalid."})
 	}
 	effective.FSRS = fsrsConfig
+	effective.Topic = topicConfig
+	effective.LearningDay = learningDayConfig
+	effective.LearningDayLocation = learningDayLocation
 	sort.Slice(effective.Diagnostics, func(i, j int) bool {
 		if effective.Diagnostics[i].SourcePath != effective.Diagnostics[j].SourcePath {
 			return effective.Diagnostics[i].SourcePath < effective.Diagnostics[j].SourcePath
@@ -174,6 +250,62 @@ func (c Config) LoadEffectiveSchedulerConfig() EffectiveSchedulerConfig {
 		return effective.Diagnostics[i].Code < effective.Diagnostics[j].Code
 	})
 	return effective
+}
+
+func (effective EffectiveSchedulerConfig) ResolveLearningDayID(instant time.Time) string {
+	location := effective.LearningDayLocation
+	if location == nil {
+		location = time.UTC
+	}
+	local := instant.In(location)
+	date := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, time.UTC)
+	boundary, err := localWallClockBoundary(date, effective.LearningDay.MidnightShiftHours, location)
+	if err == nil && instant.Before(boundary) {
+		date = date.AddDate(0, 0, -1)
+	}
+	return date.Format("2006-01-02")
+}
+
+func (effective EffectiveSchedulerConfig) TimeForLearningDayID(day string) (time.Time, error) {
+	location := effective.LearningDayLocation
+	if location == nil {
+		location = time.UTC
+	}
+	date, err := time.Parse("2006-01-02", day)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return localWallClockBoundary(date, effective.LearningDay.MidnightShiftHours, location)
+}
+
+func localWallClockBoundary(date time.Time, hour int, location *time.Location) (time.Time, error) {
+	wallClock := time.Date(date.Year(), date.Month(), date.Day(), hour, 0, 0, 0, time.UTC)
+	offsets := map[int]struct{}{}
+	for probe := wallClock.Add(-48 * time.Hour); !probe.After(wallClock.Add(48 * time.Hour)); probe = probe.Add(time.Hour) {
+		_, offset := probe.In(location).Zone()
+		offsets[offset] = struct{}{}
+	}
+	var boundary time.Time
+	bestWallSecond := 24 * 60 * 60
+	for offset := range offsets {
+		candidate := wallClock.Add(-time.Duration(offset) * time.Second)
+		local := candidate.In(location)
+		if local.Year() != date.Year() || local.Month() != date.Month() || local.Day() != date.Day() {
+			continue
+		}
+		wallSecond := local.Hour()*60*60 + local.Minute()*60 + local.Second()
+		if wallSecond < hour*60*60 {
+			continue
+		}
+		if boundary.IsZero() || wallSecond < bestWallSecond || (wallSecond == bestWallSecond && candidate.Before(boundary)) {
+			boundary = candidate
+			bestWallSecond = wallSecond
+		}
+	}
+	if boundary.IsZero() {
+		return time.Time{}, fmt.Errorf("resolve local Learning Day boundary for %s at %02d:00", date.Format("2006-01-02"), hour)
+	}
+	return boundary, nil
 }
 
 func (c Config) LoadTracerSchedulerConfig() (SchedulerConfig, error) {
@@ -241,6 +373,18 @@ func (c Config) BootstrapSchedulerConfig() error {
 			return err
 		}
 	}
+	learningDayPath := filepath.Join(c.SchedulerRoot, "learning-day.json")
+	if _, err := os.Stat(learningDayPath); errors.Is(err, os.ErrNotExist) {
+		data, marshalErr := json.MarshalIndent(defaultLearningDayConfig(), "", "  ")
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if err = filelock.WriteFile(learningDayPath, append(data, '\n')); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -283,18 +427,19 @@ type elementSourceRecord struct {
 }
 
 const (
-	sourceUnreadableCode = "unreadable-element-source"
-	sourceMalformedCode  = "malformed-element-source"
-	sourceMissingCode    = "missing-element-source"
-	sourceSpecCode       = "unsupported-element-spec"
-	sourceIdentityCode   = "element-id-mismatch"
-	sourcePayloadCode    = "unsupported-element-payload"
-	sourceIncompleteCode = "incomplete-element-source"
-	sourceDuplicateCode  = "duplicate-element-id"
-	sourceMissingParent  = "missing-root-parent"
-	sourceInvalidSort    = "invalid-sort-metadata"
-	materialInvalidBlock = "invalid-block-reference"
-	materialEncrypted    = "encrypted-source-unsupported"
+	sourceUnreadableCode             = "unreadable-element-source"
+	sourceMalformedCode              = "malformed-element-source"
+	sourceMissingCode                = "missing-element-source"
+	sourceSpecCode                   = "unsupported-element-spec"
+	sourceIdentityCode               = "element-id-mismatch"
+	sourcePayloadCode                = "unsupported-element-payload"
+	sourceIncompleteCode             = "incomplete-element-source"
+	sourceDuplicateCode              = "duplicate-element-id"
+	sourceMissingParent              = "missing-root-parent"
+	sourceInvalidSort                = "invalid-sort-metadata"
+	materialInvalidBlock             = "invalid-block-reference"
+	materialEncrypted                = "encrypted-source-unsupported"
+	schedulingHistoryUnavailableCode = "unusable-scheduling-history"
 )
 
 func (c Config) scanElements() (elementScanResult, error) {
@@ -670,7 +815,7 @@ func trustworthyElementID(element Element, filename string) string {
 	return ""
 }
 
-func sourceDiagnosticsWithMissingProjections(scan elementScanResult, projections map[string]SchedulingProjection) []ElementSourceDiagnostic {
+func sourceDiagnosticsWithMissingProjections(scan elementScanResult, projections map[string]SchedulingProjection, historyElementIDs map[string]bool) []ElementSourceDiagnostic {
 	diagnostics := append([]ElementSourceDiagnostic(nil), scan.Diagnostics...)
 	knownPaths := make(map[string]bool, len(diagnostics))
 	for _, diagnostic := range diagnostics {
@@ -685,6 +830,19 @@ func sourceDiagnosticsWithMissingProjections(scan elementScanResult, projections
 			continue
 		}
 		diagnostics = append(diagnostics, ElementSourceDiagnostic{SourcePath: sourcePath, ElementID: elementID, Code: sourceMissingCode, Reason: "Element source is missing."})
+	}
+	for elementID := range historyElementIDs {
+		if _, found := scan.Elements[elementID]; !found {
+			continue
+		}
+		if _, projected := projections[elementID]; projected {
+			continue
+		}
+		sourcePath := filepath.ToSlash(elementID + ".sme")
+		if record, found := scan.Records[elementID]; found && record.SourcePath != "" {
+			sourcePath = record.SourcePath
+		}
+		diagnostics = append(diagnostics, ElementSourceDiagnostic{SourcePath: sourcePath, ElementID: elementID, Code: schedulingHistoryUnavailableCode, Reason: "Scheduling history cannot produce a valid projection."})
 	}
 	return normalizeSourceDiagnostics(diagnostics)
 }
@@ -777,7 +935,7 @@ func mergeSortedStrings(left, right []string) []string {
 var ErrUnavailableSource = errors.New("authoritative element source unavailable")
 
 func unavailableElementSource(cause error) error {
-	return domainError(ErrAuthoritativeItemUnavailable, "authoritative Item source is unavailable", cause)
+	return domainError(ErrAuthoritativeElementUnavailable, "authoritative Element source is unavailable", cause)
 }
 
 func monthFor(t time.Time) string { return t.Format("2006-01") }

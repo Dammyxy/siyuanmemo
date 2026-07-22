@@ -71,12 +71,12 @@ func NormalizeGrade(raw int) (NormalizedReview, error) {
 	return review, nil
 }
 
-func ValidateCandidate(candidate AlgorithmCandidate, descriptor AlgorithmDescriptor, reviewAt time.Time) error {
+func ValidateCandidate(candidate AlgorithmCandidate, descriptor AlgorithmDescriptor, targetKind string, reviewAt time.Time) error {
 	if candidate.Algorithm != descriptor.ID || candidate.AlgorithmVersion != descriptor.Version || candidate.StateSchemaVersion != descriptor.StateSchemaVersion {
 		return errors.New("candidate identity does not match descriptor")
 	}
-	if !supportsTarget(descriptor, "element.item") {
-		return errors.New("adapter does not support element.item")
+	if !supportsTarget(descriptor, targetKind) {
+		return errors.New("adapter does not support the target kind")
 	}
 	if candidate.NextDueAt.IsZero() || !candidate.NextDueAt.After(reviewAt) {
 		return errors.New("candidate due time must be after review time")
@@ -170,6 +170,10 @@ func (a algorithmArena) review(input AlgorithmInput) ([]AlgorithmCandidate, Algo
 }
 
 func (a algorithmArena) run(adapter AlgorithmAdapter, input AlgorithmInput) AlgorithmCandidate {
+	return evaluateAlgorithmAdapter(adapter, input)
+}
+
+func evaluateAlgorithmAdapter(adapter AlgorithmAdapter, input AlgorithmInput) AlgorithmCandidate {
 	descriptor := adapter.Describe()
 	if !supportsTarget(descriptor, input.TargetKind) {
 		return AlgorithmCandidate{Algorithm: descriptor.ID, AlgorithmVersion: descriptor.Version, StateSchemaVersion: descriptor.StateSchemaVersion, Status: "unsupported", ValidationReason: "primary-unsupported"}
@@ -198,7 +202,7 @@ func (a algorithmArena) run(adapter AlgorithmAdapter, input AlgorithmInput) Algo
 	if predictionErr == nil && prediction.Available {
 		candidate.PredictedRecallBeforeGrade = prediction.Retrievability
 	}
-	if err = ValidateCandidate(candidate, descriptor, input.Review.ReviewAt); err != nil {
+	if err = ValidateCandidate(candidate, descriptor, input.TargetKind, input.Review.ReviewAt); err != nil {
 		candidate.Status = "invalid"
 		candidate.ValidationReason = "primary-invalid-output"
 		return candidate
@@ -222,8 +226,18 @@ func validateCandidateTransition(candidate AlgorithmCandidate, input AlgorithmIn
 		previous, previousErr := decodeAlgorithmState[FSRSV1State](input.CurrentState, fsrsV1ID, 1)
 		if previousErr != nil {
 			previous = FSRSV1State{}
+		} else if !hasConsistentFSRSStateFacts(previous) {
+			return errors.New("fsrs-v1 prior state is unsupported")
 		}
-		if !next.DueAt.Equal(candidate.NextDueAt) || next.Repetitions != previous.Repetitions+1 || next.Lapses < previous.Lapses || next.Lapses > next.Repetitions {
+		expectedLapses := previous.Lapses
+		if previous.CardState == "review" && input.Review.RatingLabel == RatingAgain {
+			expectedLapses++
+		}
+		lapsesValid := next.Lapses == expectedLapses
+		if (previous.CardState == "learning" || previous.CardState == "relearning") && input.Review.RatingLabel == RatingAgain {
+			lapsesValid = next.Lapses == previous.Lapses || next.Lapses == previous.Lapses+1
+		}
+		if !hasConsistentFSRSStateFacts(next) || !next.DueAt.Equal(candidate.NextDueAt) || next.ScheduledDays != uint64(candidate.NextIntervalDays) || next.Repetitions != previous.Repetitions+1 || !lapsesValid || next.Lapses > next.Repetitions || !next.LastReviewAt.Equal(input.Review.ReviewAt) || candidate.Difficulty == nil || *candidate.Difficulty != next.Difficulty || candidate.Stability == nil || *candidate.Stability != next.Stability {
 			return errors.New("fsrs-v1 state transition is inconsistent")
 		}
 	case simpleV1ID:
@@ -235,9 +249,49 @@ func validateCandidateTransition(candidate AlgorithmCandidate, input AlgorithmIn
 		if previousErr != nil {
 			previous = SimpleV1State{}
 		}
-		if next.DueAt == nil || !next.DueAt.Equal(candidate.NextDueAt) || next.Repetitions != previous.Repetitions+1 || next.Lapses < previous.Lapses || next.Lapses > next.Repetitions {
+		expectedLapses := previous.Lapses
+		if input.Review.RawGrade <= 2 {
+			expectedLapses++
+		}
+		expectedInterval := 1
+		if input.Review.RawGrade >= 3 {
+			previousInterval := previous.IntervalDays
+			if previousInterval < 1 {
+				previousInterval = 1
+			}
+			multiplier := input.Review.RawGrade - 2
+			if previousInterval > int(^uint(0)>>1)/multiplier {
+				return errors.New("simple-v1 interval overflow")
+			}
+			expectedInterval = previousInterval * multiplier
+		}
+		expectedDueAt := input.Review.ReviewAt.AddDate(0, 0, candidate.NextIntervalDays)
+		if candidate.NextIntervalDays != expectedInterval || next.DueAt == nil || !next.DueAt.Equal(candidate.NextDueAt) || !candidate.NextDueAt.Equal(expectedDueAt) || next.IntervalDays != candidate.NextIntervalDays || next.Repetitions != previous.Repetitions+1 || next.Lapses != expectedLapses || next.Lapses > next.Repetitions || next.LastReviewAt == nil || !next.LastReviewAt.Equal(input.Review.ReviewAt) {
 			return errors.New("simple-v1 state transition is inconsistent")
+		}
+	case topicAFactorV1ID:
+		next, err := decodeAlgorithmState[TopicAFactorV1State](candidate.NextState, topicAFactorV1ID, 1)
+		if err != nil {
+			return err
+		}
+		previous, previousErr := decodeAlgorithmState[TopicAFactorV1State](input.CurrentState, topicAFactorV1ID, 1)
+		if previousErr != nil {
+			previous = TopicAFactorV1State{}
+		}
+		expectedDueDay := addLearningDays(input.Review.LearningDayID, candidate.NextIntervalDays)
+		if next.IntervalDays != candidate.NextIntervalDays || next.Repetitions != previous.Repetitions+1 || next.LastLearningDay != input.Review.LearningDayID || next.DueLearningDay != expectedDueDay {
+			return errors.New("topic-afactor-v1 state transition is inconsistent")
 		}
 	}
 	return nil
+}
+
+func hasConsistentFSRSStateFacts(state FSRSV1State) bool {
+	if !isSupportedFSRSCardState(state.CardState) {
+		return false
+	}
+	if state.CardState == "new" && (state.Repetitions != 0 || state.Lapses != 0 || !state.LastReviewAt.IsZero()) {
+		return false
+	}
+	return true
 }

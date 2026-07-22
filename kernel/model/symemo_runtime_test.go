@@ -18,6 +18,7 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"go/ast"
 	"go/parser"
@@ -31,6 +32,8 @@ import (
 	"time"
 
 	"github.com/88250/lute/parse"
+	"github.com/siyuan-note/dejavu"
+	"github.com/siyuan-note/dejavu/entity"
 	"github.com/siyuan-note/siyuan/kernel/model/symemo"
 	"github.com/siyuan-note/siyuan/kernel/treenode"
 )
@@ -135,6 +138,33 @@ func TestSymemoRuntimeWaitsForStorageSyncBeforeTakingLease(t *testing.T) {
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSymemoRuntimeSyncDrainRejectsNewLeaseBeforeReplacement(t *testing.T) {
+	root := t.TempDir()
+	config := symemo.Config{StorageRoot: filepath.Join(root, "storage"), IndexRoot: filepath.Join(root, "temp", "siyuanmemo")}
+	opens := 0
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		opens++
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hostRuntime.Close() })
+
+	hostRuntime.beginSyncDrain()
+	if _, err := hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryCurrentSession}); err == nil {
+		t.Fatal("sync drain admitted a new Runtime lease")
+	} else {
+		assertSymemoRuntimeCode(t, err, symemo.ErrProjectionRebuildFailed)
+	}
+	if err := hostRuntime.rebuild(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if opens != 2 {
+		t.Fatalf("Engine opens = %d, want replacement", opens)
 	}
 }
 
@@ -606,6 +636,262 @@ func TestSymemoServingEntrypointsPreserveRuntimeStartupBoundary(t *testing.T) {
 	}
 }
 
+func TestSyncMergeProcessesSymemoAuthorityBeforeStorageGateOpens(t *testing.T) {
+	repositoryFile := parseGoTestFile(t, "repository.go")
+	calls := goCallNames(mustGoFunctionBody(t, repositoryFile, "processSyncMergeResult"))
+	if count := countGoCall(calls, "rebuildSymemoAfterSyncMerge"); count != 1 {
+		t.Fatalf("processSyncMergeResult calls rebuildSymemoAfterSyncMerge %d times", count)
+	}
+	assertGoCallOrder(t, "processSyncMergeResult", calls, []string{"rebuildSymemoAfterSyncMerge", "syncingStorages.Store"})
+}
+
+func TestSyncMergeBeginsRuntimeDrainBeforeClosingStorageGate(t *testing.T) {
+	repositoryFile := parseGoTestFile(t, "repository.go")
+	calls := goCallNames(mustGoFunctionBody(t, repositoryFile, "processSyncMergeResult"))
+	if count := countGoCall(calls, "workspaceSymemoRuntime.beginSyncDrain"); count != 1 {
+		t.Fatalf("processSyncMergeResult begins Runtime sync drain %d times", count)
+	}
+	assertGoCallOrder(t, "processSyncMergeResult", calls, []string{"workspaceSymemoRuntime.beginSyncDrain", "syncingStorages.Store", "rebuildSymemoAfterSyncMerge"})
+}
+
+func TestSyncRebuildDefersUntilRuntimeInitialization(t *testing.T) {
+	root := t.TempDir()
+	config := symemo.Config{StorageRoot: filepath.Join(root, "storage"), IndexRoot: filepath.Join(root, "temp", "siyuanmemo")}
+	opens := 0
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		opens++
+		return symemo.NewEngine(ctx, config)
+	})
+	original := workspaceSymemoRuntime
+	workspaceSymemoRuntime = hostRuntime
+	t.Cleanup(func() {
+		workspaceSymemoRuntime = original
+		_ = hostRuntime.Close()
+	})
+
+	rebuildSymemoAfterSyncMerge(&dejavu.MergeResult{Upserts: []*entity.File{{Path: "/storage/siyuanmemo/reviews/2026-07.smr"}}})
+	if opens != 0 || hostRuntime.state != symemoRuntimeUninitialized {
+		t.Fatalf("startup sync opened Runtime before initialization: opens=%d state=%d", opens, hostRuntime.state)
+	}
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if opens != 1 {
+		t.Fatalf("initialization opens = %d, want 1", opens)
+	}
+}
+
+func TestRebuildSymemoAfterSyncMergeFiltersAuthorityPaths(t *testing.T) {
+	tests := []struct {
+		name        string
+		mergeResult *dejavu.MergeResult
+		wantRebuild bool
+	}{
+		{name: "upsert", mergeResult: &dejavu.MergeResult{Upserts: []*entity.File{{Path: "/storage/siyuanmemo/reviews/2026-07.smr"}}}, wantRebuild: true},
+		{name: "remove", mergeResult: &dejavu.MergeResult{Removes: []*entity.File{{Path: "/storage/siyuanmemo/elements/root.sme"}}}, wantRebuild: true},
+		{name: "conflict", mergeResult: &dejavu.MergeResult{Conflicts: []*entity.File{{Path: "/storage/siyuanmemo/scheduler/learning-day.json"}}}, wantRebuild: true},
+		{name: "other storage", mergeResult: &dejavu.MergeResult{Upserts: []*entity.File{{Path: "/storage/riff/deck.json"}}}},
+		{name: "similar prefix", mergeResult: &dejavu.MergeResult{Removes: []*entity.File{{Path: "/storage/siyuanmemo-old/reviews/2026-07.smr"}}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			config := symemo.Config{StorageRoot: filepath.Join(root, "storage"), IndexRoot: filepath.Join(root, "temp", "siyuanmemo")}
+			opens := 0
+			hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+				opens++
+				return symemo.NewEngine(ctx, config)
+			})
+			if err := hostRuntime.initialize(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			original := workspaceSymemoRuntime
+			workspaceSymemoRuntime = hostRuntime
+			t.Cleanup(func() {
+				workspaceSymemoRuntime = original
+				_ = hostRuntime.Close()
+			})
+
+			rebuildSymemoAfterSyncMerge(test.mergeResult)
+			wantOpens := 1
+			if test.wantRebuild {
+				wantOpens = 2
+			}
+			if opens != wantOpens {
+				t.Fatalf("Engine opens = %d, want %d", opens, wantOpens)
+			}
+		})
+	}
+}
+
+func TestRebuildSymemoAfterSyncMergePublishesChangedAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		mergeResult func() *dejavu.MergeResult
+		change      func(t *testing.T, config symemo.Config)
+		verify      func(t *testing.T, runtime *symemoRuntime)
+	}{
+		{
+			name: "upsert",
+			mergeResult: func() *dejavu.MergeResult {
+				return &dejavu.MergeResult{Upserts: []*entity.File{{Path: "/storage/siyuanmemo/elements/" + runtimeSymemoFixtureElementID + ".sme"}}}
+			},
+			change: func(t *testing.T, config symemo.Config) { rewriteRuntimeFixturePrompt(t, config, "synced upsert") },
+			verify: func(t *testing.T, runtime *symemoRuntime) { assertRuntimeFixturePrompt(t, runtime, "synced upsert") },
+		},
+		{
+			name: "conflict",
+			mergeResult: func() *dejavu.MergeResult {
+				return &dejavu.MergeResult{Conflicts: []*entity.File{{Path: "/storage/siyuanmemo/elements/" + runtimeSymemoFixtureElementID + ".sme"}}}
+			},
+			change: func(t *testing.T, config symemo.Config) { rewriteRuntimeFixturePrompt(t, config, "synced conflict") },
+			verify: func(t *testing.T, runtime *symemoRuntime) { assertRuntimeFixturePrompt(t, runtime, "synced conflict") },
+		},
+		{
+			name: "remove",
+			mergeResult: func() *dejavu.MergeResult {
+				return &dejavu.MergeResult{Removes: []*entity.File{{Path: "/storage/siyuanmemo/elements/" + runtimeSymemoFixtureElementID + ".sme"}}}
+			},
+			change: func(t *testing.T, config symemo.Config) {
+				if err := os.Remove(filepath.Join(config.StorageRoot, "elements", runtimeSymemoFixtureElementID+".sme")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			verify: func(t *testing.T, runtime *symemoRuntime) {
+				_, err := runtime.query(t.Context(), symemo.Query{Kind: symemo.QueryElement, ElementID: runtimeSymemoFixtureElementID})
+				assertSymemoRuntimeCode(t, err, symemo.ErrElementSourceUnavailable)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := runtimeSymemoFixtureConfig(t)
+			hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) { return symemo.NewEngine(ctx, config) })
+			if err := hostRuntime.initialize(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			original := workspaceSymemoRuntime
+			workspaceSymemoRuntime = hostRuntime
+			t.Cleanup(func() {
+				workspaceSymemoRuntime = original
+				_ = hostRuntime.Close()
+			})
+			test.change(t, config)
+			rebuildSymemoAfterSyncMerge(test.mergeResult())
+			test.verify(t, hostRuntime)
+		})
+	}
+}
+
+func TestRebuildSymemoAfterSyncMergeDrainsLeaseAndExcludesStaleEngine(t *testing.T) {
+	root := t.TempDir()
+	config := symemo.Config{StorageRoot: filepath.Join(root, "storage"), IndexRoot: filepath.Join(root, "temp", "siyuanmemo")}
+	opens := 0
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		opens++
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	hostRuntime.mu.Lock()
+	first := hostRuntime.engine
+	hostRuntime.mu.Unlock()
+	original := workspaceSymemoRuntime
+	workspaceSymemoRuntime = hostRuntime
+	t.Cleanup(func() {
+		workspaceSymemoRuntime = original
+		_ = hostRuntime.Close()
+	})
+
+	operationStarted := make(chan struct{})
+	releaseOperation := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseOperation) }) }
+	t.Cleanup(release)
+	operationDone := make(chan error, 1)
+	go func() {
+		operationDone <- hostRuntime.withEngine(func(engine *symemo.Engine) error {
+			if engine != first {
+				return errors.New("active operation received stale replacement")
+			}
+			close(operationStarted)
+			<-releaseOperation
+			return nil
+		})
+	}()
+	<-operationStarted
+	rebuildDone := make(chan struct{})
+	go func() {
+		rebuildSymemoAfterSyncMerge(&dejavu.MergeResult{Upserts: []*entity.File{{Path: "/storage/siyuanmemo/reviews/2026-07.smr"}}})
+		close(rebuildDone)
+	}()
+	for attempt := 0; attempt < 1000; attempt++ {
+		hostRuntime.mu.Lock()
+		draining := hostRuntime.draining
+		hostRuntime.mu.Unlock()
+		if draining {
+			break
+		}
+		if attempt == 999 {
+			t.Fatal("sync rebuild did not begin draining")
+		}
+		runtime.Gosched()
+	}
+	if _, err := hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryCurrentSession}); err == nil {
+		t.Fatal("sync draining admitted stale Engine work")
+	} else {
+		assertSymemoRuntimeCode(t, err, symemo.ErrProjectionRebuildFailed)
+	}
+	select {
+	case <-rebuildDone:
+		t.Fatal("sync rebuild completed before active lease drained")
+	default:
+	}
+	release()
+	if err := <-operationDone; err != nil {
+		t.Fatal(err)
+	}
+	<-rebuildDone
+	hostRuntime.mu.Lock()
+	replacement := hostRuntime.engine
+	hostRuntime.mu.Unlock()
+	if replacement == nil || replacement == first || opens != 2 {
+		t.Fatalf("replacement=%p first=%p opens=%d", replacement, first, opens)
+	}
+}
+
+func TestRebuildSymemoAfterSyncMergeFailureLeavesRuntimeUnavailable(t *testing.T) {
+	root := t.TempDir()
+	config := symemo.Config{StorageRoot: filepath.Join(root, "storage"), IndexRoot: filepath.Join(root, "temp", "siyuanmemo")}
+	opens := 0
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		opens++
+		if opens == 2 {
+			return nil, errors.New("injected sync replacement failure")
+		}
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	original := workspaceSymemoRuntime
+	workspaceSymemoRuntime = hostRuntime
+	t.Cleanup(func() {
+		workspaceSymemoRuntime = original
+		_ = hostRuntime.Close()
+	})
+
+	rebuildSymemoAfterSyncMerge(&dejavu.MergeResult{Conflicts: []*entity.File{{Path: "/storage/siyuanmemo/elements/root.sme"}}})
+	if _, err := hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryCurrentSession}); err == nil {
+		t.Fatal("failed sync rebuild left Runtime available")
+	} else {
+		assertSymemoRuntimeCode(t, err, symemo.ErrProjectionRebuildFailed)
+	}
+	if opens != 2 {
+		t.Fatalf("failed sync rebuild opened %d Engines", opens)
+	}
+}
+
 func parseGoTestFile(t *testing.T, path string) *ast.File {
 	t.Helper()
 	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
@@ -766,7 +1052,9 @@ func runtimeSymemoFixtureConfig(t *testing.T) symemo.Config {
 		"scheduler/collection.json",
 		"scheduler/simple-v1.json",
 		"scheduler/fsrs-v1.json",
+		"scheduler/topic-afactor-v1.json",
 		"scheduler/arena-v1.json",
+		"scheduler/learning-day.json",
 	} {
 		source := filepath.Join("symemo", "testdata", filepath.FromSlash(relative))
 		target := filepath.Join(root, filepath.FromSlash(relative))
@@ -789,6 +1077,38 @@ func runtimeSymemoFixtureConfig(t *testing.T) symemo.Config {
 		SchedulerRoot: filepath.Join(root, "scheduler"),
 		Now:           func() time.Time { return clock },
 		Location:      location,
+	}
+}
+
+func rewriteRuntimeFixturePrompt(t *testing.T, config symemo.Config, prompt string) {
+	t.Helper()
+	path := filepath.Join(config.StorageRoot, "elements", runtimeSymemoFixtureElementID+".sme")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var element symemo.Element
+	if err = json.Unmarshal(data, &element); err != nil {
+		t.Fatal(err)
+	}
+	element.Payload.Prompt = prompt
+	data, err = json.Marshal(element)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertRuntimeFixturePrompt(t *testing.T, runtime *symemoRuntime, prompt string) {
+	t.Helper()
+	result, err := runtime.query(t.Context(), symemo.Query{Kind: symemo.QueryElement, ElementID: runtimeSymemoFixtureElementID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Element == nil || result.Element.Payload.Prompt != prompt {
+		t.Fatalf("rebuilt Element = %#v, want prompt %q", result.Element, prompt)
 	}
 }
 

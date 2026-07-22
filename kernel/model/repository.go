@@ -2018,6 +2018,10 @@ func processSyncMergeResult(exit, byHand bool, mergeResult *dejavu.MergeResult, 
 		len(mergeResult.Conflicts), len(mergeResult.Upserts), len(mergeResult.Removes))
 
 	//logSyncMergeResult(mergeResult)
+	if syncMergeChangesSymemoAuthority(mergeResult) {
+		workspaceSymemoRuntime.beginSyncDrain()
+		syncingStorages.Store(true)
+	}
 
 	var needReloadFiletree bool
 	if 0 < len(mergeResult.Conflicts) {
@@ -2244,6 +2248,7 @@ func processSyncMergeResult(exit, byHand bool, mergeResult *dejavu.MergeResult, 
 		gulu.File.RemoveEmptyDirs(widgetDirPath)
 	}
 
+	rebuildSymemoAfterSyncMerge(mergeResult)
 	syncingFiles = sync.Map{}
 	syncingStorages.Store(false)
 
@@ -2304,6 +2309,29 @@ func processSyncMergeResult(exit, byHand bool, mergeResult *dejavu.MergeResult, 
 			}
 		}
 	}()
+}
+
+func rebuildSymemoAfterSyncMerge(mergeResult *dejavu.MergeResult) {
+	if !syncMergeChangesSymemoAuthority(mergeResult) {
+		return
+	}
+	if err := workspaceSymemoRuntime.rebuild(context.Background()); err != nil && !errors.Is(err, errSymemoRuntimeUninitialized) {
+		logging.LogErrorf("rebuild SiYuanMemo after data synchronization failed: %s", err)
+	}
+}
+
+func syncMergeChangesSymemoAuthority(mergeResult *dejavu.MergeResult) bool {
+	if mergeResult == nil {
+		return false
+	}
+	for _, files := range [][]*entity.File{mergeResult.Upserts, mergeResult.Removes, mergeResult.Conflicts} {
+		for _, file := range files {
+			if file != nil && strings.HasPrefix(file.Path, "/storage/siyuanmemo/") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func logSyncMergeResult(mergeResult *dejavu.MergeResult) {

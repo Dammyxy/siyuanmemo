@@ -51,3 +51,10 @@ func writeProjectionSchemaMismatch(t *testing.T, engine *Engine) {
 		t.Fatal(err)
 	}
 }
+
+func corruptProjectionPayload(t *testing.T, engine *Engine) {
+	t.Helper()
+	if _, err := engine.index.db.Exec("UPDATE projections SET projection_json = '{' WHERE element_id = ?", fixtureElementID); err != nil {
+		t.Fatal(err)
+	}
+}

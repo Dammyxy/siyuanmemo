@@ -48,6 +48,11 @@ func TestSymemoRoutes(t *testing.T) {
 		"POST /api/symemo/startLearning":               false,
 		"POST /api/symemo/showAnswer":                  false,
 		"POST /api/symemo/gradeItem":                   false,
+		"POST /api/symemo/nextTopic":                   false,
+		"POST /api/symemo/acceptLearningStage":         false,
+		"POST /api/symemo/declineLearningStage":        false,
+		"POST /api/symemo/gradeDrill":                  false,
+		"POST /api/symemo/stopLearning":                false,
 		"POST /api/symemo/getCurrentLearningSession":   false,
 	}
 	for _, route := range server.Routes() {
@@ -66,6 +71,26 @@ func TestSymemoRoutes(t *testing.T) {
 		if !found {
 			t.Errorf("missing route %s", route)
 		}
+	}
+}
+
+func TestSymemoAuthoritativeElementUnavailableMessageUsesKernelLanguage(t *testing.T) {
+	previousConf, previousLangs := model.Conf, util.Langs
+	model.Conf = &model.AppConf{Lang: "symemo-test"}
+	util.Langs = map[string]map[int]string{
+		"symemo-test": {325: "Localized learning Element unavailable."},
+		"en":          {325: "English learning Element unavailable."},
+	}
+	t.Cleanup(func() {
+		model.Conf, util.Langs = previousConf, previousLangs
+	})
+
+	if got := symemoSafeMessage(string(symemo.ErrAuthoritativeElementUnavailable)); got != "Localized learning Element unavailable." {
+		t.Fatalf("localized authoritative Element unavailable message = %q", got)
+	}
+	model.Conf = nil
+	if got := symemoSafeMessage(string(symemo.ErrAuthoritativeElementUnavailable)); got != "The learning Element is unavailable." {
+		t.Fatalf("authoritative Element unavailable fallback = %q", got)
 	}
 }
 
@@ -133,6 +158,11 @@ func TestSymemoHandlersUseRuntimeFacadeExactlyOnce(t *testing.T) {
 		{"start learning", startSymemoLearning, `{}`, 0, 1},
 		{"show answer", showSymemoAnswer, `{"elementId":"20260719010101-abcdefg"}`, 0, 1},
 		{"grade item", gradeSymemoItem, `{"elementId":"20260719010101-abcdefg","rawGrade":4,"eventId":"event-1"}`, 0, 1},
+		{"next topic", nextSymemoTopic, `{"elementId":"20260719020101-topicaa","eventId":"event-2"}`, 0, 1},
+		{"accept learning stage", acceptSymemoLearningStage, `{"stage":"pending"}`, 0, 1},
+		{"decline learning stage", declineSymemoLearningStage, `{"stage":"finalDrill"}`, 0, 1},
+		{"grade drill", gradeSymemoDrill, `{"elementId":"20260719010101-abcdefg","rawGrade":4,"eventId":"event-3"}`, 0, 1},
+		{"stop learning", stopSymemoLearning, `{}`, 0, 1},
 		{"current session", getSymemoCurrentSession, `{}`, 1, 0},
 	}
 	for _, test := range tests {
@@ -222,6 +252,54 @@ func TestSymemoAcceptedTriggerRecoveryAndSubsequentLatch(t *testing.T) {
 	}
 }
 
+func TestSymemoNextTopicTransportUsesElementUnavailableAndQueueAdvanceContracts(t *testing.T) {
+	previousBooted := symemoIsBooted
+	previousLearningAction := symemoRunLearningAction
+	symemoIsBooted = func() bool { return true }
+	session := &symemo.SessionState{
+		SessionID: "topic-transport-session",
+		Status:    symemo.SessionActive,
+		Stage:     symemo.StageOutstanding,
+		Phase:     symemo.PhaseQuestion,
+		Current:   &symemo.ReviewTarget{Kind: "element.topic", ElementID: symemoFixtureElementID},
+	}
+	symemoRunLearningAction = func(_ context.Context, action symemo.LearningAction) (symemo.LearningResult, error) {
+		switch action.EventID {
+		case "topic-target-unavailable":
+			return symemo.LearningResult{}, &symemo.DomainError{Code: symemo.ErrAuthoritativeElementUnavailable, Session: session}
+		case "topic-queue-advance-failed":
+			failed := *session
+			failed.PendingAcceptedEventID = action.EventID
+			return symemo.LearningResult{}, &symemo.DomainError{Code: symemo.ErrQueueAdvanceFailed, Retryable: true, ReviewAccepted: true, AcceptedEventID: action.EventID, Session: &failed}
+		default:
+			return symemo.LearningResult{}, nil
+		}
+	}
+	t.Cleanup(func() {
+		symemoIsBooted = previousBooted
+		symemoRunLearningAction = previousLearningAction
+	})
+
+	unavailable := invokeSymemoHandler(t, nextSymemoTopic, `{"elementId":"`+symemoFixtureElementID+`","eventId":"topic-target-unavailable"}`)
+	assertSymemoFailure(t, unavailable, string(symemo.ErrAuthoritativeElementUnavailable), "The learning Element is unavailable.")
+
+	advance := invokeSymemoHandler(t, nextSymemoTopic, `{"elementId":"`+symemoFixtureElementID+`","eventId":"topic-queue-advance-failed"}`)
+	assertSymemoFailure(t, advance, string(symemo.ErrQueueAdvanceFailed), "The review was saved, but the learning queue could not advance.")
+	var envelope struct {
+		Data struct {
+			ReviewAccepted bool                 `json:"reviewAccepted"`
+			AcceptedEvent  string               `json:"acceptedEventId"`
+			Session        *symemo.SessionState `json:"session"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(advance.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if !envelope.Data.ReviewAccepted || envelope.Data.AcceptedEvent != "topic-queue-advance-failed" || envelope.Data.Session == nil || envelope.Data.Session.PendingAcceptedEventID != "topic-queue-advance-failed" {
+		t.Fatalf("Topic queue-advance envelope = %#v", envelope)
+	}
+}
+
 func TestSymemoHandlersRemainTransportOnly(t *testing.T) {
 	data, err := os.ReadFile("symemo.go")
 	if err != nil {
@@ -241,6 +319,11 @@ func TestSymemoHandlersRemainTransportOnly(t *testing.T) {
 		`ginServer.Handle("POST", "/api/symemo/startLearning", model.CheckAuth, model.CheckAdminRole, startSymemoLearning)`,
 		`ginServer.Handle("POST", "/api/symemo/showAnswer", model.CheckAuth, model.CheckAdminRole, showSymemoAnswer)`,
 		`ginServer.Handle("POST", "/api/symemo/gradeItem", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, gradeSymemoItem)`,
+		`ginServer.Handle("POST", "/api/symemo/nextTopic", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, nextSymemoTopic)`,
+		`ginServer.Handle("POST", "/api/symemo/acceptLearningStage", model.CheckAuth, model.CheckAdminRole, acceptSymemoLearningStage)`,
+		`ginServer.Handle("POST", "/api/symemo/declineLearningStage", model.CheckAuth, model.CheckAdminRole, declineSymemoLearningStage)`,
+		`ginServer.Handle("POST", "/api/symemo/gradeDrill", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, gradeSymemoDrill)`,
+		`ginServer.Handle("POST", "/api/symemo/stopLearning", model.CheckAuth, model.CheckAdminRole, stopSymemoLearning)`,
 		`ginServer.Handle("POST", "/api/symemo/getCurrentLearningSession", model.CheckAuth, model.CheckAdminRole, getSymemoCurrentSession)`,
 	}
 	for _, registration := range registrations {
@@ -307,7 +390,8 @@ func TestSymemoTransportEnvelopeAndAnswerRedaction(t *testing.T) {
 	}
 
 	current := invokeSymemoHandler(t, getSymemoCurrentSession, `{}`)
-	if code := envelopeCode(t, current); code != 0 || !strings.Contains(string(envelopeData(t, current)), `"completed"`) {
+	currentData := string(envelopeData(t, current))
+	if code := envelopeCode(t, current); code != 0 || !strings.Contains(currentData, `"phase":"confirmation"`) || !strings.Contains(currentData, `"stage":"pending"`) {
 		t.Fatalf("current session envelope = %s", current.Body.String())
 	}
 }

@@ -2136,6 +2136,7 @@
 		"321": "Access to encrypted notebook data is not supported via this API",
 		"322": "Encrypted notebook [%s] has been automatically locked due to inactivity",
 		"323": "Cannot disable encrypted notebooks: deleted-notebook history still depends on the current key backup. Clear that history first",
-		"324": "Cannot import a key backup while encrypted notebooks are enabled. Disable it first"
+		"324": "Cannot import a key backup while encrypted notebooks are enabled. Disable it first",
+		"325": "The learning Element is unavailable."
 	}
 	}

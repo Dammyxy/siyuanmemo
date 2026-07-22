@@ -29,12 +29,11 @@ import (
 	"sort"
 	"strconv"
 	"sync"
-	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
-const projectionSchemaVersion = 3
+const projectionSchemaVersion = 6
 
 var errProjectionNotFound = errors.New("projection not found")
 
@@ -42,6 +41,15 @@ type projectionIndex struct {
 	path string
 	db   *sql.DB
 	mu   sync.RWMutex
+}
+
+type projectionSnapshot struct {
+	Elements                 map[string]Element
+	Tree                     []ElementTreeNode
+	Projections              map[string]SchedulingProjection
+	FinalDrillProjections    map[string]FinalDrillProjection
+	HistoryEventFingerprints map[string]bool
+	BlockedElementIDs        map[string]bool
 }
 
 func openProjectionIndex(path string) (*projectionIndex, error) {
@@ -93,6 +101,8 @@ func (index *projectionIndex) openFresh() error {
 		"CREATE TABLE elements (id TEXT PRIMARY KEY, source_json BLOB NOT NULL)",
 		"CREATE TABLE tree (key TEXT PRIMARY KEY, tree_json BLOB NOT NULL)",
 		"CREATE TABLE projections (element_id TEXT PRIMARY KEY, projection_json BLOB NOT NULL)",
+		"CREATE TABLE final_drill_projections (element_id TEXT PRIMARY KEY, projection_json BLOB NOT NULL)",
+		"CREATE TABLE history_event_fingerprints (fingerprint TEXT PRIMARY KEY)",
 		"CREATE TABLE diagnostics (event_id TEXT NOT NULL, payload_hash TEXT NOT NULL, diagnostic_json BLOB NOT NULL, PRIMARY KEY(event_id, payload_hash))",
 		"CREATE TABLE source_diagnostics (source_path TEXT NOT NULL, code TEXT NOT NULL, element_id TEXT NOT NULL, diagnostic_json BLOB NOT NULL, PRIMARY KEY(source_path, code, element_id))",
 		"INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
@@ -121,7 +131,7 @@ func (index *projectionIndex) replaceAll(ctx context.Context, build projectionBu
 		return err
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"elements", "tree", "projections", "diagnostics", "source_diagnostics"} {
+	for _, table := range []string{"elements", "tree", "projections", "final_drill_projections", "history_event_fingerprints", "diagnostics", "source_diagnostics"} {
 		if _, err = tx.Exec("DELETE FROM " + table); err != nil {
 			return err
 		}
@@ -158,6 +168,25 @@ func (index *projectionIndex) replaceAll(ctx context.Context, build projectionBu
 			return marshalErr
 		}
 		if _, err = tx.Exec("INSERT INTO projections(element_id, projection_json) VALUES(?, ?)", id, data); err != nil {
+			return err
+		}
+	}
+	finalDrillIDs := make([]string, 0, len(build.FinalDrillProjections))
+	for id := range build.FinalDrillProjections {
+		finalDrillIDs = append(finalDrillIDs, id)
+	}
+	sort.Strings(finalDrillIDs)
+	for _, id := range finalDrillIDs {
+		data, marshalErr := json.Marshal(build.FinalDrillProjections[id])
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if _, err = tx.Exec("INSERT INTO final_drill_projections(element_id, projection_json) VALUES(?, ?)", id, data); err != nil {
+			return err
+		}
+	}
+	for _, fingerprint := range build.HistoryEventFingerprints {
+		if _, err = tx.Exec("INSERT INTO history_event_fingerprints(fingerprint) VALUES(?)", fingerprint); err != nil {
 			return err
 		}
 	}
@@ -239,6 +268,23 @@ func (index *projectionIndex) projection(elementID string) (SchedulingProjection
 	return projection, nil
 }
 
+func (index *projectionIndex) finalDrillProjection(elementID string) (FinalDrillProjection, error) {
+	index.mu.RLock()
+	defer index.mu.RUnlock()
+	var data []byte
+	if err := index.db.QueryRow("SELECT projection_json FROM final_drill_projections WHERE element_id = ?", elementID).Scan(&data); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return FinalDrillProjection{}, errProjectionNotFound
+		}
+		return FinalDrillProjection{}, err
+	}
+	var projection FinalDrillProjection
+	if err := json.Unmarshal(data, &projection); err != nil {
+		return FinalDrillProjection{}, err
+	}
+	return projection, nil
+}
+
 func (index *projectionIndex) element(elementID string) (Element, error) {
 	index.mu.RLock()
 	defer index.mu.RUnlock()
@@ -256,55 +302,109 @@ func (index *projectionIndex) element(elementID string) (Element, error) {
 	return element, nil
 }
 
-func (index *projectionIndex) dueTargets(now time.Time, learningDate string) ([]ReviewTarget, error) {
+func (index *projectionIndex) snapshot() (projectionSnapshot, error) {
 	index.mu.RLock()
 	defer index.mu.RUnlock()
-	rows, err := index.db.Query("SELECT e.source_json, p.projection_json FROM elements e JOIN projections p ON p.element_id = e.id")
+	snapshot := projectionSnapshot{Elements: map[string]Element{}, Projections: map[string]SchedulingProjection{}, FinalDrillProjections: map[string]FinalDrillProjection{}, HistoryEventFingerprints: map[string]bool{}, BlockedElementIDs: map[string]bool{}}
+	elementRows, err := index.db.Query("SELECT id, source_json FROM elements ORDER BY id")
 	if err != nil {
-		return nil, err
+		return projectionSnapshot{}, err
 	}
-	defer rows.Close()
-	var targets []ReviewTarget
-	for rows.Next() {
-		var elementData, projectionData []byte
-		if err = rows.Scan(&elementData, &projectionData); err != nil {
-			return nil, err
+	defer elementRows.Close()
+	for elementRows.Next() {
+		var id string
+		var data []byte
+		if err = elementRows.Scan(&id, &data); err != nil {
+			return projectionSnapshot{}, err
 		}
 		var element Element
+		if err = json.Unmarshal(data, &element); err != nil {
+			return projectionSnapshot{}, err
+		}
+		snapshot.Elements[id] = element
+	}
+	if err = elementRows.Err(); err != nil {
+		return projectionSnapshot{}, err
+	}
+	projectionRows, err := index.db.Query("SELECT element_id, projection_json FROM projections ORDER BY element_id")
+	if err != nil {
+		return projectionSnapshot{}, err
+	}
+	defer projectionRows.Close()
+	for projectionRows.Next() {
+		var id string
+		var data []byte
+		if err = projectionRows.Scan(&id, &data); err != nil {
+			return projectionSnapshot{}, err
+		}
 		var projection SchedulingProjection
-		if err = json.Unmarshal(elementData, &element); err != nil {
-			return nil, err
+		if err = json.Unmarshal(data, &projection); err != nil {
+			return projectionSnapshot{}, err
 		}
-		if err = json.Unmarshal(projectionData, &projection); err != nil {
-			return nil, err
-		}
-		if !isSchedulableItem(element, projection) || projection.LifecycleState != "memorized" || projection.DueAt.After(now) || projection.LastLearningDate == learningDate {
-			continue
-		}
-		targets = append(targets, ReviewTarget{
-			Kind:                        "element.item",
-			ElementID:                   element.ID,
-			Prompt:                      element.Payload.Prompt,
-			DueAt:                       projection.DueAt,
-			PriorityPosition:            projection.PriorityPosition,
-			ObservedBaseSchedulingEvent: projection.AdoptedTerminalID,
-			ObservedProjection:          projection,
-			LearningDate:                learningDate,
-		})
+		snapshot.Projections[id] = projection
 	}
-	if err = rows.Err(); err != nil {
-		return nil, err
+	if err = projectionRows.Err(); err != nil {
+		return projectionSnapshot{}, err
 	}
-	sort.Slice(targets, func(i, j int) bool {
-		if !targets[i].DueAt.Equal(targets[j].DueAt) {
-			return targets[i].DueAt.Before(targets[j].DueAt)
+	finalDrillRows, err := index.db.Query("SELECT element_id, projection_json FROM final_drill_projections ORDER BY element_id")
+	if err != nil {
+		return projectionSnapshot{}, err
+	}
+	defer finalDrillRows.Close()
+	for finalDrillRows.Next() {
+		var id string
+		var data []byte
+		if err = finalDrillRows.Scan(&id, &data); err != nil {
+			return projectionSnapshot{}, err
 		}
-		if targets[i].PriorityPosition != targets[j].PriorityPosition {
-			return targets[i].PriorityPosition < targets[j].PriorityPosition
+		var projection FinalDrillProjection
+		if err = json.Unmarshal(data, &projection); err != nil {
+			return projectionSnapshot{}, err
 		}
-		return targets[i].ElementID < targets[j].ElementID
-	})
-	return targets, nil
+		snapshot.FinalDrillProjections[id] = projection
+	}
+	if err = finalDrillRows.Err(); err != nil {
+		return projectionSnapshot{}, err
+	}
+	historyRows, err := index.db.Query("SELECT fingerprint FROM history_event_fingerprints ORDER BY fingerprint")
+	if err != nil {
+		return projectionSnapshot{}, err
+	}
+	defer historyRows.Close()
+	for historyRows.Next() {
+		var fingerprint string
+		if err = historyRows.Scan(&fingerprint); err != nil {
+			return projectionSnapshot{}, err
+		}
+		snapshot.HistoryEventFingerprints[fingerprint] = true
+	}
+	if err = historyRows.Err(); err != nil {
+		return projectionSnapshot{}, err
+	}
+	var treeData []byte
+	if err = index.db.QueryRow("SELECT tree_json FROM tree WHERE key = 'default'").Scan(&treeData); err == nil {
+		if err = json.Unmarshal(treeData, &snapshot.Tree); err != nil {
+			return projectionSnapshot{}, err
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return projectionSnapshot{}, err
+	}
+	blockedRows, err := index.db.Query("SELECT element_id FROM source_diagnostics WHERE code = ? ORDER BY element_id", schedulingHistoryUnavailableCode)
+	if err != nil {
+		return projectionSnapshot{}, err
+	}
+	defer blockedRows.Close()
+	for blockedRows.Next() {
+		var id string
+		if err = blockedRows.Scan(&id); err != nil {
+			return projectionSnapshot{}, err
+		}
+		snapshot.BlockedElementIDs[id] = true
+	}
+	if err = blockedRows.Err(); err != nil {
+		return projectionSnapshot{}, err
+	}
+	return snapshot, nil
 }
 
 func (index *projectionIndex) close() error {

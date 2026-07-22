@@ -46,23 +46,30 @@ const (
 )
 
 var symemoSafeMessages = map[string]string{
-	symemoInvalidRequestCode:                       "Invalid request.",
-	symemoInternalErrorCode:                        "SiYuanMemo could not complete the request.",
-	string(symemo.ErrUnsupportedOperation):         "This operation is not supported.",
-	string(symemo.ErrInvalidSessionPhase):          "This learning action is not available in the current phase.",
-	string(symemo.ErrTargetMismatch):               "The requested Element is not the current learning target.",
-	string(symemo.ErrUnsupportedGrade):             "The grade is not supported.",
-	string(symemo.ErrAuthoritativeItemUnavailable): "The learning Item is unavailable.",
-	string(symemo.ErrUnsupportedAlgorithmState):    "The scheduling state is not supported.",
-	string(symemo.ErrInvalidAlgorithmOutput):       "The scheduling result is invalid.",
-	string(symemo.ErrDurableWriteFailed):           "The review could not be saved.",
-	string(symemo.ErrProjectionRefreshFailed):      "The review was saved, but its schedule could not be refreshed.",
-	string(symemo.ErrQueueAdvanceFailed):           "The review was saved, but the learning queue could not advance.",
-	string(symemo.ErrHistoryRequiresRepair):        "The review history requires repair.",
-	string(symemo.ErrElementNotFound):              "The Element was not found.",
-	string(symemo.ErrElementSourceUnavailable):     "The Element source is unavailable.",
-	string(symemo.ErrElementSourceAmbiguous):       "The Element source is ambiguous.",
-	string(symemo.ErrProjectionRebuildFailed):      "The Element index could not be rebuilt.",
+	symemoInvalidRequestCode:                          "Invalid request.",
+	symemoInternalErrorCode:                           "SiYuanMemo could not complete the request.",
+	string(symemo.ErrUnsupportedOperation):            "This operation is not supported.",
+	string(symemo.ErrInvalidSessionPhase):             "This learning action is not available in the current phase.",
+	string(symemo.ErrTargetMismatch):                  "The requested Element is not the current learning target.",
+	string(symemo.ErrUnsupportedGrade):                "The grade is not supported.",
+	string(symemo.ErrAuthoritativeElementUnavailable): "The learning Element is unavailable.",
+	string(symemo.ErrUnsupportedAlgorithmState):       "The scheduling state is not supported.",
+	string(symemo.ErrInvalidAlgorithmOutput):          "The scheduling result is invalid.",
+	string(symemo.ErrDurableWriteFailed):              "The review could not be saved.",
+	string(symemo.ErrProjectionRefreshFailed):         "The review was saved, but its schedule could not be refreshed.",
+	string(symemo.ErrQueueAdvanceFailed):              "The review was saved, but the learning queue could not advance.",
+	string(symemo.ErrHistoryRequiresRepair):           "The review history requires repair.",
+	string(symemo.ErrElementNotFound):                 "The Element was not found.",
+	string(symemo.ErrElementSourceUnavailable):        "The Element source is unavailable.",
+	string(symemo.ErrElementSourceAmbiguous):          "The Element source is ambiguous.",
+	string(symemo.ErrProjectionRebuildFailed):         "The Element index could not be rebuilt.",
+}
+
+func symemoSafeMessage(code string) string {
+	if code == string(symemo.ErrAuthoritativeElementUnavailable) && model.Conf != nil {
+		return model.Conf.Language(325)
+	}
+	return symemoSafeMessages[code]
 }
 
 func registerSymemoRoutes(ginServer *gin.Engine) {
@@ -73,6 +80,11 @@ func registerSymemoRoutes(ginServer *gin.Engine) {
 	ginServer.Handle("POST", "/api/symemo/startLearning", model.CheckAuth, model.CheckAdminRole, startSymemoLearning)
 	ginServer.Handle("POST", "/api/symemo/showAnswer", model.CheckAuth, model.CheckAdminRole, showSymemoAnswer)
 	ginServer.Handle("POST", "/api/symemo/gradeItem", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, gradeSymemoItem)
+	ginServer.Handle("POST", "/api/symemo/nextTopic", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, nextSymemoTopic)
+	ginServer.Handle("POST", "/api/symemo/acceptLearningStage", model.CheckAuth, model.CheckAdminRole, acceptSymemoLearningStage)
+	ginServer.Handle("POST", "/api/symemo/declineLearningStage", model.CheckAuth, model.CheckAdminRole, declineSymemoLearningStage)
+	ginServer.Handle("POST", "/api/symemo/gradeDrill", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, gradeSymemoDrill)
+	ginServer.Handle("POST", "/api/symemo/stopLearning", model.CheckAuth, model.CheckAdminRole, stopSymemoLearning)
 	ginServer.Handle("POST", "/api/symemo/getCurrentLearningSession", model.CheckAuth, model.CheckAdminRole, getSymemoCurrentSession)
 }
 
@@ -98,6 +110,15 @@ type symemoGradeRequest struct {
 	ElementID string `json:"elementId" binding:"required"`
 	RawGrade  *int   `json:"rawGrade" binding:"required"`
 	EventID   string `json:"eventId" binding:"required"`
+}
+
+type symemoNextTopicRequest struct {
+	ElementID string `json:"elementId" binding:"required"`
+	EventID   string `json:"eventId" binding:"required"`
+}
+
+type symemoStageRequest struct {
+	Stage symemo.LearningStage `json:"stage" binding:"required"`
 }
 
 func getSymemoElementSubset(c *gin.Context) {
@@ -230,6 +251,85 @@ func gradeSymemoItem(c *gin.Context) {
 	writeSymemoSuccess(c, result)
 }
 
+func nextSymemoTopic(c *gin.Context) {
+	var request symemoNextTopicRequest
+	if !bindSymemoRequest(c, &request) {
+		return
+	}
+	if !ensureSymemoBooted(c) {
+		return
+	}
+	result, err := symemoRunLearningAction(c, symemo.LearningAction{Kind: symemo.ActionNextTopic, ElementID: request.ElementID, EventID: request.EventID})
+	if err != nil {
+		writeSymemoError(c, err)
+		return
+	}
+	writeSymemoSuccess(c, result)
+}
+
+func acceptSymemoLearningStage(c *gin.Context) {
+	var request symemoStageRequest
+	if !bindSymemoRequest(c, &request) {
+		return
+	}
+	if !ensureSymemoBooted(c) {
+		return
+	}
+	result, err := symemoRunLearningAction(c, symemo.LearningAction{Kind: symemo.ActionAcceptStageTransition, Stage: request.Stage})
+	if err != nil {
+		writeSymemoError(c, err)
+		return
+	}
+	writeSymemoSuccess(c, result.Session)
+}
+
+func declineSymemoLearningStage(c *gin.Context) {
+	var request symemoStageRequest
+	if !bindSymemoRequest(c, &request) {
+		return
+	}
+	if !ensureSymemoBooted(c) {
+		return
+	}
+	result, err := symemoRunLearningAction(c, symemo.LearningAction{Kind: symemo.ActionDeclineStageTransition, Stage: request.Stage})
+	if err != nil {
+		writeSymemoError(c, err)
+		return
+	}
+	writeSymemoSuccess(c, result.Session)
+}
+
+func gradeSymemoDrill(c *gin.Context) {
+	var request symemoGradeRequest
+	if !bindSymemoRequest(c, &request) {
+		return
+	}
+	if !ensureSymemoBooted(c) {
+		return
+	}
+	result, err := symemoRunLearningAction(c, symemo.LearningAction{Kind: symemo.ActionGradeDrill, ElementID: request.ElementID, RawGrade: request.RawGrade, EventID: request.EventID})
+	if err != nil {
+		writeSymemoError(c, err)
+		return
+	}
+	writeSymemoSuccess(c, result)
+}
+
+func stopSymemoLearning(c *gin.Context) {
+	if !bindSymemoEmptyRequest(c) {
+		return
+	}
+	if !ensureSymemoBooted(c) {
+		return
+	}
+	result, err := symemoRunLearningAction(c, symemo.LearningAction{Kind: symemo.ActionStop})
+	if err != nil {
+		writeSymemoError(c, err)
+		return
+	}
+	writeSymemoSuccess(c, result.Session)
+}
+
 func getSymemoCurrentSession(c *gin.Context) {
 	if !bindSymemoEmptyRequest(c) {
 		return
@@ -247,7 +347,7 @@ func getSymemoCurrentSession(c *gin.Context) {
 
 func bindSymemoRequest(c *gin.Context, request any) bool {
 	if err := c.ShouldBindJSON(request); err != nil {
-		writeSymemoFailure(c, symemoSafeMessages[symemoInvalidRequestCode], map[string]any{"errorCode": symemoInvalidRequestCode, "retryable": false})
+		writeSymemoFailure(c, symemoSafeMessage(symemoInvalidRequestCode), map[string]any{"errorCode": symemoInvalidRequestCode, "retryable": false})
 		return false
 	}
 	return true
@@ -270,10 +370,11 @@ func writeSymemoSuccess(c *gin.Context, data any) {
 func writeSymemoError(c *gin.Context, err error) {
 	if domainErr, ok := symemo.AsDomainError(err); ok {
 		code := string(domainErr.Code)
-		message, known := symemoSafeMessages[code]
+		message := symemoSafeMessage(code)
+		_, known := symemoSafeMessages[code]
 		if !known {
 			symemoLogError(symemoInternalErrorCode, err)
-			writeSymemoFailure(c, symemoSafeMessages[symemoInternalErrorCode], map[string]any{"errorCode": symemoInternalErrorCode, "retryable": false})
+			writeSymemoFailure(c, symemoSafeMessage(symemoInternalErrorCode), map[string]any{"errorCode": symemoInternalErrorCode, "retryable": false})
 			return
 		}
 		if domainErr.Cause != nil {
@@ -283,7 +384,7 @@ func writeSymemoError(c *gin.Context, err error) {
 		return
 	}
 	symemoLogError(symemoInternalErrorCode, err)
-	writeSymemoFailure(c, symemoSafeMessages[symemoInternalErrorCode], map[string]any{"errorCode": symemoInternalErrorCode, "retryable": false})
+	writeSymemoFailure(c, symemoSafeMessage(symemoInternalErrorCode), map[string]any{"errorCode": symemoInternalErrorCode, "retryable": false})
 }
 
 func writeSymemoFailure(c *gin.Context, message string, data map[string]any) {

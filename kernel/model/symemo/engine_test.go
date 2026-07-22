@@ -19,6 +19,7 @@ package symemo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -99,8 +100,8 @@ func TestEngineItemQueueRejectsNonItemElements(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if started.Session == nil || started.Session.Status != SessionCompleted {
-		t.Fatalf("non-Items started an Item session: %#v", started.Session)
+	if started.Session == nil || started.Session.Phase != PhaseConfirmation || started.Session.Confirmation == nil || started.Session.Confirmation.Stage != StagePending || started.Session.Current != nil {
+		t.Fatalf("non-Items started an Outstanding item session: %#v", started.Session)
 	}
 	grade := 4
 	for _, elementID := range []string{treeTopicID, treeConceptID, treeInvalidID, treeFutureID} {
@@ -318,6 +319,10 @@ func TestEngineAcceptedGradeRetriesQueueAdvancement(t *testing.T) {
 	if !hasCode(err, ErrQueueAdvanceFailed) {
 		t.Fatalf("different retry error = %v", err)
 	}
+	_, err = engine.RunLearningAction(context.Background(), LearningAction{Kind: ActionGradeItem, ElementID: fixtureElementID, RawGrade: &otherGrade, EventID: eventID})
+	if !hasCode(err, ErrHistoryRequiresRepair) {
+		t.Fatalf("conflicting accepted retry error = %v", err)
+	}
 	if err = os.WriteFile(secondElementPath, secondElementData, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -337,6 +342,248 @@ func TestEngineAcceptedGradeRetriesQueueAdvancement(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("accepted event count = %d", count)
+	}
+}
+
+func TestDrillAcceptedGradeRetriesQueueAdvancementWithoutDuplicateTargets(t *testing.T) {
+	config, ids := finalDrillFixtureConfig(t, 5, nil)
+	const blockTopicID = "20260722020501-blocktp"
+	const blockID = "20260722020501-blockaa"
+	addDueDailyTopic(t, config, blockTopicID, "Future Block Topic", "2026-07-30", 20)
+	topic := mustElementFile(t, filepath.Join(config.ElementsRoot(), blockTopicID+".sme"))
+	topic.Payload.Material = &TopicMaterial{Kind: "siyuanBlock", BlockID: blockID}
+	addRootElement(t, config, topic)
+	reader := &fakeBlockReferenceReader{lookupResults: map[string]BlockReferenceResolution{
+		blockID: {BlockID: blockID, Status: MaterialSourceAvailable},
+	}}
+	config.BlockReader = reader
+	engine, err := NewEngine(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+
+	started, err := engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionStart})
+	if err != nil || started.Session == nil || started.Session.Confirmation == nil || started.Session.Confirmation.Stage != StageFinalDrill {
+		t.Fatalf("start Final Drill = %#v, err=%v", started, err)
+	}
+	accepted, err := engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionAcceptStageTransition, Stage: StageFinalDrill})
+	if err != nil || accepted.Session == nil || accepted.Session.Current == nil || accepted.Session.Current.ElementID != ids[0] {
+		t.Fatalf("accept Final Drill = %#v, err=%v", accepted, err)
+	}
+	beforeOrder := append([]string{accepted.Session.Current.ElementID}, accepted.Session.RemainingElementIDs...)
+	if _, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionShowAnswer, ElementID: ids[0]}); err != nil {
+		t.Fatal(err)
+	}
+	reader.lookupErr = errors.New("reconcile Final Drill membership")
+
+	eventID := "accepted-drill-before-queue-failure"
+	low := 2
+	_, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionGradeDrill, ElementID: ids[0], RawGrade: &low, EventID: eventID})
+	domainErr, ok := AsDomainError(err)
+	if !ok || domainErr.Code != ErrQueueAdvanceFailed || !domainErr.ReviewAccepted || domainErr.AcceptedEventID != eventID || domainErr.Session == nil || domainErr.Session.Current == nil {
+		t.Fatalf("Drill queue advancement error = %#v", domainErr)
+	}
+	failedOrder := append([]string{domainErr.Session.Current.ElementID}, domainErr.Session.RemainingElementIDs...)
+	if !reflect.DeepEqual(failedOrder, beforeOrder) {
+		t.Fatalf("failed Drill advancement mutated order\nbefore=%#v\nafter=%#v", beforeOrder, failedOrder)
+	}
+	_, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionGradeItem, ElementID: ids[0], RawGrade: &low, EventID: eventID})
+	if !hasCode(err, ErrHistoryRequiresRepair) {
+		t.Fatalf("Item action recovered accepted Drill event: %v", err)
+	}
+	reader.lookupErr = nil
+	recovered, err := engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionGradeDrill, ElementID: ids[0], RawGrade: &low, EventID: eventID})
+	if err != nil || !recovered.ReviewAccepted || recovered.Session == nil || recovered.Session.Current == nil {
+		t.Fatalf("recover Drill advancement = %#v, err=%v", recovered, err)
+	}
+	recoveredOrder := append([]string{recovered.Session.Current.ElementID}, recovered.Session.RemainingElementIDs...)
+	if !sameStringSet(recoveredOrder, ids) || len(recoveredOrder) != len(ids) {
+		t.Fatalf("recovered Drill queue lost or duplicated targets: %#v", recoveredOrder)
+	}
+	if countEventsByID(t, config, eventID) != 1 {
+		t.Fatal("Drill queue recovery wrote a duplicate event")
+	}
+}
+
+func TestLearningEventIdentityCannotCrossActionFamilies(t *testing.T) {
+	t.Run("Drill event as Item grade", func(t *testing.T) {
+		config, ids := finalDrillFixtureConfig(t, 1, nil)
+		engine, err := NewEngine(t.Context(), config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = engine.Close() })
+		if _, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionStart}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionAcceptStageTransition, Stage: StageFinalDrill}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionShowAnswer, ElementID: ids[0]}); err != nil {
+			t.Fatal(err)
+		}
+		grade := 4
+		eventID := "cross-action-drill-event"
+		if _, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionGradeDrill, ElementID: ids[0], RawGrade: &grade, EventID: eventID}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionGradeItem, ElementID: ids[0], RawGrade: &grade, EventID: eventID}); !hasCode(err, ErrHistoryRequiresRepair) {
+			t.Fatalf("Item grade accepted Drill event identity: %v", err)
+		}
+	})
+
+	t.Run("Item event as Drill grade", func(t *testing.T) {
+		engine, _ := newFixtureEngine(t)
+		if _, err := engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionStart}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionShowAnswer, ElementID: fixtureElementID}); err != nil {
+			t.Fatal(err)
+		}
+		grade := 3
+		eventID := "cross-action-item-event"
+		if _, err := engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionGradeItem, ElementID: fixtureElementID, RawGrade: &grade, EventID: eventID}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionGradeDrill, ElementID: fixtureElementID, RawGrade: &grade, EventID: eventID}); !hasCode(err, ErrHistoryRequiresRepair) {
+			t.Fatalf("Drill grade accepted Item event identity: %v", err)
+		}
+	})
+}
+
+func TestAcceptedTopicRetriesTransactionalQueueAdvancement(t *testing.T) {
+	config := copyFixtureWorkspace(t)
+	installDailyLearningConfig(t, config, "Asia/Shanghai", 4)
+	reviewPath := filepath.Join(config.ReviewsRoot(), "2026-07.smr")
+	file := readEventFile(t, reviewPath)
+	moveLegacyItemIntroductionDue(t, &file.Events[0], time.Date(2026, time.July, 30, 8, 0, 0, 0, config.Location))
+	writeTestJSON(t, reviewPath, file)
+	firstID := "20260719040101-duetopc"
+	secondID := "20260719040102-duetopc"
+	addDueDailyTopic(t, config, firstID, "First due Topic", "2026-07-18", 0)
+	addDueDailyTopic(t, config, secondID, "Second due Topic", "2026-07-19", 1)
+	assertAcceptedQueueAdvanceRetry(t, config, StageOutstanding, firstID, secondID, LearningAction{Kind: ActionNextTopic, EventID: "accepted-topic-before-queue-failure"})
+}
+
+func TestAcceptedPendingActionsRetryTransactionalQueueAdvancement(t *testing.T) {
+	tests := []struct {
+		name       string
+		first      Element
+		second     Element
+		actionKind LearningActionKind
+	}{
+		{name: "Item", first: pendingItemElement("20260719040201-pnditem", "Pending Item"), second: pendingTopicElement("20260719040202-pndtopc", "Pending Topic"), actionKind: ActionGradeItem},
+		{name: "Topic", first: pendingTopicElement("20260719040301-pndtopc", "Pending Topic"), second: pendingItemElement("20260719040302-pnditem", "Pending Item"), actionKind: ActionNextTopic},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := copyFixtureWorkspace(t)
+			installDailyLearningConfig(t, config, "Asia/Shanghai", 4)
+			reviewPath := filepath.Join(config.ReviewsRoot(), "2026-07.smr")
+			file := readEventFile(t, reviewPath)
+			moveLegacyItemIntroductionDue(t, &file.Events[0], time.Date(2026, time.July, 30, 8, 0, 0, 0, config.Location))
+			writeTestJSON(t, reviewPath, file)
+			addRootElement(t, config, test.first)
+			addRootElement(t, config, test.second)
+			action := LearningAction{Kind: test.actionKind, EventID: "accepted-pending-" + test.name + "-before-queue-failure"}
+			assertAcceptedQueueAdvanceRetry(t, config, StagePending, test.first.ID, test.second.ID, action)
+		})
+	}
+}
+
+func TestAcceptedPassingDrillRetriesTransactionalQueueAdvancement(t *testing.T) {
+	config, ids := finalDrillFixtureConfig(t, 2, nil)
+	grade := 4
+	assertAcceptedQueueAdvanceRetry(t, config, StageFinalDrill, ids[0], ids[1], LearningAction{Kind: ActionGradeDrill, RawGrade: &grade, EventID: "accepted-passing-drill-before-queue-failure"})
+}
+
+func assertAcceptedQueueAdvanceRetry(t *testing.T, config Config, stage LearningStage, currentID, nextID string, action LearningAction) {
+	t.Helper()
+	var reader *fakeBlockReferenceReader
+	if stage == StageFinalDrill {
+		const blockTopicID = "20260722020601-blocktp"
+		const blockID = "20260722020601-blockaa"
+		addDueDailyTopic(t, config, blockTopicID, "Future Block Topic", "2026-07-30", 20)
+		topic := mustElementFile(t, filepath.Join(config.ElementsRoot(), blockTopicID+".sme"))
+		topic.Payload.Material = &TopicMaterial{Kind: "siyuanBlock", BlockID: blockID}
+		addRootElement(t, config, topic)
+		reader = &fakeBlockReferenceReader{lookupResults: map[string]BlockReferenceResolution{
+			blockID: {BlockID: blockID, Status: MaterialSourceAvailable},
+		}}
+		config.BlockReader = reader
+	}
+	engine, err := NewEngine(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	started, err := engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionStart})
+	if err != nil || started.Session == nil {
+		t.Fatalf("start = %#v, err=%v", started, err)
+	}
+	if stage != StageOutstanding {
+		if started.Session.Confirmation == nil || started.Session.Confirmation.Stage != stage {
+			t.Fatalf("stage confirmation = %#v", started.Session)
+		}
+		started, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionAcceptStageTransition, Stage: stage})
+		if err != nil || started.Session == nil {
+			t.Fatalf("accept stage = %#v, err=%v", started, err)
+		}
+	}
+	if started.Session.Current == nil || started.Session.Current.ElementID != currentID || len(started.Session.RemainingElementIDs) == 0 || started.Session.RemainingElementIDs[0] != nextID {
+		t.Fatalf("initial queue = %#v", started.Session)
+	}
+	beforeOrder := append([]string{currentID}, started.Session.RemainingElementIDs...)
+	if action.Kind == ActionGradeItem || action.Kind == ActionGradeDrill {
+		if _, err = engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionShowAnswer, ElementID: currentID}); err != nil {
+			t.Fatal(err)
+		}
+		if action.RawGrade == nil {
+			grade := 4
+			action.RawGrade = &grade
+		}
+	}
+	action.ElementID = currentID
+	var nextPath string
+	var nextData []byte
+	if stage == StageFinalDrill {
+		reader.lookupErr = errors.New("reconcile Final Drill membership")
+	} else {
+		nextPath = filepath.Join(config.ElementsRoot(), nextID+".sme")
+		nextData, err = os.ReadFile(nextPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = os.Remove(nextPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err = engine.RunLearningAction(t.Context(), action)
+	domainErr, ok := AsDomainError(err)
+	if !ok || domainErr.Code != ErrQueueAdvanceFailed || !domainErr.ReviewAccepted || domainErr.AcceptedEventID != action.EventID || domainErr.Session == nil || domainErr.Session.Current == nil {
+		t.Fatalf("queue advancement error = %#v", domainErr)
+	}
+	failedOrder := append([]string{domainErr.Session.Current.ElementID}, domainErr.Session.RemainingElementIDs...)
+	if !reflect.DeepEqual(failedOrder, beforeOrder) {
+		t.Fatalf("failed advancement mutated queue\nbefore=%#v\nafter=%#v", beforeOrder, failedOrder)
+	}
+	different := action
+	different.EventID += "-different"
+	if _, differentErr := engine.RunLearningAction(t.Context(), different); !hasCode(differentErr, ErrQueueAdvanceFailed) {
+		t.Fatalf("different retry identity error = %v", differentErr)
+	}
+	if stage == StageFinalDrill {
+		reader.lookupErr = nil
+	} else if err = os.WriteFile(nextPath, nextData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := engine.RunLearningAction(t.Context(), action)
+	if err != nil || !recovered.ReviewAccepted || recovered.Session == nil || recovered.Session.Current == nil || recovered.Session.Current.ElementID != nextID {
+		t.Fatalf("queue recovery = %#v, err=%v", recovered, err)
+	}
+	if countEventsByID(t, config, action.EventID) != 1 {
+		t.Fatalf("queue recovery duplicated event %q", action.EventID)
 	}
 }
 
@@ -374,7 +621,7 @@ func newTwoItemFixtureEngine(t *testing.T) (*Engine, Config, string, []byte) {
 	if err = json.Unmarshal(reviewData, &file); err != nil {
 		t.Fatal(err)
 	}
-	secondIntroduction := file.Events[0]
+	secondIntroduction := cloneSchedulingEvent(t, file.Events[0])
 	secondIntroduction.EventID = "20260716080500-intro002"
 	secondIntroduction.OccurredAt = time.Date(2026, time.July, 16, 8, 5, 0, 0, config.Location)
 	secondIntroduction.ElementID = secondFixtureElementID
@@ -382,7 +629,12 @@ func newTwoItemFixtureEngine(t *testing.T) (*Engine, Config, string, []byte) {
 	secondIntroduction.After.ElementID = secondFixtureElementID
 	secondIntroduction.After.AdoptedTerminalID = secondIntroduction.EventID
 	secondIntroduction.After.DueAt = time.Date(2026, time.July, 19, 8, 30, 0, 0, config.Location)
+	alignLegacyItemIntroductionState(t, &secondIntroduction)
 	file.Events = append(file.Events, secondIntroduction)
+	projections, diagnostics := projectSchedulingEvents(file.Events)
+	if len(projections) != 2 {
+		t.Fatalf("two-Item fixture projections = %#v, diagnostics=%#v", projections, diagnostics)
+	}
 	writeTestJSON(t, reviewPath, file)
 
 	engine, err := NewEngine(context.Background(), config)

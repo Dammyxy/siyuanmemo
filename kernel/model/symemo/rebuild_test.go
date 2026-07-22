@@ -63,6 +63,149 @@ func TestRebuildAfterProjectionRemoval(t *testing.T) {
 	}
 }
 
+func TestRebuildPreservesRecordedLearningDayAfterConfigurationChange(t *testing.T) {
+	current := time.Date(2026, time.July, 20, 2, 0, 0, 0, time.UTC)
+	config := copyFixtureWorkspace(t)
+	config.Location = time.UTC
+	config.Now = func() time.Time { return current }
+	installDailyLearningConfig(t, config, "UTC", 4)
+	reviewPath := filepath.Join(config.ReviewsRoot(), "2026-07.smr")
+	event := modernItemIntroductionEvent(t, config, fixtureElementID, "20260720020000-recorded-day", 0, 4)
+	writeTestJSON(t, reviewPath, EventFile{Spec: 1, Month: "2026-07", Events: []SchedulingEvent{event}})
+	engine, err := NewEngine(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(reviewPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestJSON(t, filepath.Join(config.SchedulerRoot, "learning-day.json"), LearningDayConfigV1{Spec: 1, TimeZoneIANA: "Asia/Shanghai", MidnightShiftHours: 4})
+	removeSQLiteFiles(config.IndexPath())
+	rebuilt, err := NewEngine(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rebuilt.Close() })
+	after, err := os.ReadFile(reviewPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("projection rebuild rewrote accepted history after Learning Day configuration change")
+	}
+	replayed := eventByID(t, mustEvents(t, config), event.EventID)
+	projection, err := rebuilt.ledger.Snapshot(fixtureElementID)
+	if err != nil || replayed.LearningDayID != event.LearningDayID || replayed.LearningDate != event.LearningDate || projection.LastLearningDate != event.LearningDayID {
+		t.Fatalf("rebuilt recorded day changed: event=%#v projection=%#v err=%v", replayed, projection, err)
+	}
+}
+
+func TestExpiredFinalDrillGenerationRejectsDelayedActivityAndStartsFresh(t *testing.T) {
+	current := time.Date(2026, time.July, 19, 9, 0, 0, 0, time.FixedZone("CST", 8*60*60))
+	config, _ := finalDrillFixtureConfig(t, 1, func() time.Time { return current })
+	admission := mustEvents(t, config)[0]
+	normalized, err := NormalizeGrade(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delayed := SchedulingEvent{
+		Spec:                  SupportedEventSpec,
+		EventID:               "20260720090000-delayed-old-generation",
+		OccurredAt:            current.AddDate(0, 0, 1),
+		Type:                  "drillElement",
+		ElementID:             admission.ElementID,
+		SessionID:             "delayed-session",
+		ReviewKind:            "drillGrade",
+		RawGrade:              intPointer(2),
+		Passed:                boolPointer(normalized.Passed),
+		RatingLabel:           normalized.RatingLabel,
+		RatingMapping:         normalized.RatingMapping,
+		LearningDate:          "2026-07-20",
+		LearningDayID:         "2026-07-20",
+		DrillEffect:           "retain",
+		DrillAdmissionEventID: admission.EventID,
+		Before:                admission.After,
+		After:                 admission.After,
+	}
+	_, drill, diagnostics := projectSchedulingTruth([]SchedulingEvent{admission, delayed}, "2026-07-20")
+	old := drill[admission.ElementID]
+	if old.Member || !old.Expired || old.AdoptedTerminalEventID != "" {
+		t.Fatalf("delayed activity revived expired generation: %#v", old)
+	}
+	if diagnostic := diagnosticByID(diagnostics, delayed.EventID); diagnostic.Classification != "invalid" || diagnostic.Reason != "drill-member-missing" {
+		t.Fatalf("delayed activity diagnostic = %#v", diagnostic)
+	}
+
+	const newID = "20260722050101-newgene"
+	newConfig := config
+	newConfig.Now = func() time.Time { return current.AddDate(0, 0, 4) }
+	newAdmission := modernItemIntroductionEvent(t, newConfig, newID, "20260723090000-new-generation", 1, 3)
+	_, drill, diagnostics = projectSchedulingTruth([]SchedulingEvent{admission, delayed, newAdmission}, "2026-07-23")
+	if old = drill[admission.ElementID]; old.Member || !old.Expired {
+		t.Fatalf("new generation implicitly restored former member: %#v", old)
+	}
+	if fresh := drill[newID]; !fresh.Member || fresh.Expired || fresh.AdmissionEventID != newAdmission.EventID {
+		t.Fatalf("fresh generation = %#v", fresh)
+	}
+	if diagnostic := diagnosticByID(diagnostics, delayed.EventID); diagnostic.Classification != "invalid" {
+		t.Fatalf("new generation reclassified delayed activity: %#v", diagnostic)
+	}
+}
+
+func TestRebuildTwentyTimesProducesIdenticalLearningTruth(t *testing.T) {
+	config, ids := finalDrillFixtureConfig(t, 2, nil)
+	reviewPath := filepath.Join(config.ReviewsRoot(), "2026-07.smr")
+	file := readEventFile(t, reviewPath)
+	combined := concurrentHistory(t)
+	for _, event := range file.Events {
+		if event.ElementID == ids[1] {
+			combined = append(combined, event)
+		}
+	}
+	file.Events = combined
+	writeTestJSON(t, reviewPath, file)
+
+	expected := ""
+	for iteration := 0; iteration < 20; iteration++ {
+		removeSQLiteFiles(config.IndexPath())
+		engine, err := NewEngine(t.Context(), config)
+		if err != nil {
+			t.Fatalf("rebuild %d: %v", iteration, err)
+		}
+		snapshot, err := engine.index.snapshot()
+		if err != nil {
+			_ = engine.Close()
+			t.Fatal(err)
+		}
+		plan, err := engine.scheduler.BuildLearningPlan(t.Context())
+		if err != nil {
+			_ = engine.Close()
+			t.Fatal(err)
+		}
+		actual, err := canonicalHash(struct {
+			Snapshot projectionSnapshot
+			Plan     learningPlan
+		}{Snapshot: snapshot, Plan: plan})
+		if closeErr := engine.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if iteration == 0 {
+			expected = actual
+			continue
+		}
+		if actual != expected {
+			t.Fatalf("rebuild %d differs: got %s, want %s", iteration, actual, expected)
+		}
+	}
+}
+
 func TestRebuildCorruptProjection(t *testing.T) {
 	engine, config := newFixtureEngine(t)
 	expected, err := engine.ledger.Snapshot(fixtureElementID)
@@ -107,6 +250,51 @@ func TestRebuildSchemaMismatch(t *testing.T) {
 	}
 }
 
+func TestCorruptProjectionPayloadDoesNotBlockAuthoritativeRebuild(t *testing.T) {
+	engine, _ := newFixtureEngine(t)
+	corruptProjectionPayload(t, engine)
+	if err := engine.refreshProjection(t.Context()); err != nil {
+		t.Fatalf("rebuild from corrupt projection payload: %v", err)
+	}
+	projection, err := engine.ledger.Snapshot(fixtureElementID)
+	if err != nil || projection.AdoptedTerminalID != "20260716080000-intro001" {
+		t.Fatalf("rebuilt projection = %#v, err=%v", projection, err)
+	}
+}
+
+func TestProjectionSnapshotPersistsLearningDayAndSeparateDrillProjection(t *testing.T) {
+	engine, _ := newFixtureEngine(t)
+	projection := SchedulingProjection{
+		ElementID:            fixtureElementID,
+		ScheduleProfile:      fsrsV1ID,
+		AcceptedReviewAction: "GradeItem",
+		LifecycleState:       "memorized",
+		AdoptedTerminalID:    "projection-fields",
+		DueAt:                time.Date(2026, time.July, 25, 8, 0, 0, 0, engine.config.Location),
+		DueLearningDay:       "2026-07-25",
+		IntervalDays:         6,
+		Repetitions:          2,
+		PriorityPosition:     3,
+	}
+	finalDrill := FinalDrillProjection{ElementID: fixtureElementID, Member: true, LastActivityDay: "2026-07-19", AdmissionEventID: "projection-fields", AdoptedTerminalEventID: "drill-terminal"}
+	if err := engine.index.replaceAll(context.Background(), projectionBuild{
+		Elements:              map[string]Element{fixtureElementID: mustElement(t, engine)},
+		Projections:           map[string]SchedulingProjection{fixtureElementID: projection},
+		FinalDrillProjections: map[string]FinalDrillProjection{fixtureElementID: finalDrill},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := engine.index.snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := snapshot.Projections[fixtureElementID]
+	gotDrill := snapshot.FinalDrillProjections[fixtureElementID]
+	if got.DueLearningDay != projection.DueLearningDay || gotDrill != finalDrill {
+		t.Fatalf("projection fields were not persisted: formal=%#v Drill=%#v", got, gotDrill)
+	}
+}
+
 func TestRebuildAuthoritativeScanOrderAndNotDue(t *testing.T) {
 	t.Run("month order", func(t *testing.T) {
 		root := t.TempDir()
@@ -123,7 +311,7 @@ func TestRebuildAuthoritativeScanOrderAndNotDue(t *testing.T) {
 
 	t.Run("not due", func(t *testing.T) {
 		config := copyFixtureWorkspace(t)
-		clock := time.Date(2026, time.July, 19, 7, 0, 0, 0, config.Location)
+		clock := time.Date(2026, time.July, 19, 3, 59, 0, 0, config.Location)
 		config.Now = func() time.Time { return clock }
 		engine, err := NewEngine(context.Background(), config)
 		if err != nil {
