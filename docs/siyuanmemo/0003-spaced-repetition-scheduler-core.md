@@ -4,9 +4,9 @@ Date: 2026-07-19
 
 ## Decision
 
-SiYuanMemo will implement its spaced repetition core as an independent Scheduler Engine, not as a wrapper around SiYuan `riff` and not as one interval formula. The Scheduler Engine owns ReviewTarget queues, Topic reading queues, Item memory reviews, priority position, postponing, review history, versioned algorithm adapters, and profile-specific arenas that can compare compatible scheduling algorithms on the same adopted review chain.
+SiYuanMemo will implement its spaced repetition core as an independent Scheduler Engine, not as a wrapper around SiYuan `riff` and not as one interval formula. The Scheduler Engine owns ReviewTarget queues, Topic reading queues, Item memory reviews, priority position, postponing, review history, and versioned algorithm Adapters.
 
-The MVP will ship with `fsrs-v1`, `simple-v1`, and `topic-afactor-v1`. `fsrs-v1` drives Item scheduling, while `simple-v1` remains the deterministic Item fallback and shadow comparator. `topic-afactor-v1` independently drives passive Topic scheduling. The data model and Interface must already be compatible with later DSR-style, arena-based, and adaptive scheduling. "Pluggable" means algorithms plug into the Scheduler behind a stable Adapter Interface; callers still use named HTTP actions that map to Learning Engine `RunLearningAction` variants, not algorithm-specific routes.
+The MVP will ship with `fsrs-v1`, `simple-v1`, and `topic-afactor-v1`. `fsrs-v1` drives Item scheduling, while `simple-v1` remains the deterministic Item fallback and shadow comparator. `topic-afactor-v1` independently drives passive Topic scheduling. "Pluggable" means these real algorithm implementations share one Adapter Interface; callers still use named HTTP actions that map to Learning Engine `RunLearningAction` variants, not algorithm-specific routes.
 
 ## Design Summary
 
@@ -19,9 +19,8 @@ The learning system is a layered scheduler, not a single algorithm. The importan
 - **Priority model**: user priority position plus propagated priority position from Element relationships such as siblings, descendants, Concepts, and explicit links.
 - **Postpone model**: overload management that adjusts due dates based on type, priority position, interval, repetition/lapse state, thresholds, and optional randomization.
 - **Algorithm adapter model**: each compatible algorithm receives the same profile-specific review input and returns a candidate schedule without mutating Element files directly.
-- **Arena and optimizer state**: append-only review/action history plus collection-level algorithm weights, parameters, prediction scores, and learned state that can be rebuilt, optimized, migrated, or audited.
 
-This means SiYuanMemo's Scheduler Engine must separate queue selection, algorithm prediction, schedule decision, and state persistence. A Topic can be due for reading without being an Item, an Item can be reviewed for memory without becoming a SiYuan block, and a note block can appear in a NeuralRoam-style session without being converted into an Element unless the user explicitly creates one.
+This means SiYuanMemo's Scheduler Engine separates queue selection, algorithm evaluation, schedule adoption, and state persistence. A Topic can be due for reading without being an Item, an Item can be reviewed for memory without becoming a SiYuan block, and a note block can appear in a NeuralRoam-style session without being converted into an Element unless the user explicitly creates one.
 
 Opening or browsing an Element is not a scheduler event. A Topic `Next` inside an active learning session is a Topic repetition and updates schedule state; ordinary reading/navigation only updates UI state such as scroll position or read point.
 
@@ -153,29 +152,15 @@ Adapters are deterministic for the same input, adapter state, parameters, and ra
 
 The first implementation uses compiled Go adapters behind this interface. Runtime-loaded arbitrary plugins are not an MVP requirement because they complicate desktop portability and safety. A later external adapter seam may use a subprocess, WASM, or RPC adapter with the same DTOs.
 
-## Item Memory Arena
+## Item Candidate Decision
 
-The Item memory arena runs multiple compatible Item adapters over the same adopted Item review chain. Concurrent superseded or invalid branches remain audit history and are not fed into adapter state or arena training. The arena has three separate jobs:
+Scheduler runs FSRS and Simple against the same adopted Item state and normalized grade. It records both candidates and adopts one canonical schedule, so the user-facing queue never forks into competing due dates. Concurrent superseded or invalid branches remain audit history and are not fed into Adapter state.
 
-- prediction: before grading, ask each enabled adapter for predicted recall and candidate interval;
-- scoring: after grading, compare each prediction against actual binary recall, where `passed = grade >= 3`;
-- decision: choose the adopted schedule using the configured decision policy.
+The adopted schedule is still one canonical materialized `dueAt`, `intervalDays`, `repetition`, and lifecycle state for the Element. Events store valid individual predictions/candidates and the canonical result for learning and audit, but the system never forks the user-facing queue into competing due dates.
 
-The adopted schedule is still one canonical materialized `dueAt`, `intervalDays`, `repetition`, and lifecycle state for the Element. The arena stores shadow candidates and scores in the event stream for learning and audit, but it must not fork the user-facing queue into competing due dates.
+FSRS drives the normal result. `simple-v1` supplies deterministic fallback when FSRS cannot produce a valid candidate and remains a non-authoritative shadow comparator otherwise. If neither candidate is valid, the whole action fails before writing an event. Manual rescheduling remains ordinary Scheduler logic outside the Adapters.
 
-Decision policies:
-
-- `primary`: one adapter drives the adopted schedule; other adapters run in shadow mode.
-- `weightedConsensus`: enabled adapters vote by learned weights, confidence, and safety constraints.
-- `fallback`: if the primary adapter cannot handle the Element or returns invalid output, use `simple-v1`.
-- `manualOverride`: user-chosen reschedule wins, while adapters record the event as a manual intervention.
-
-Confirmed rollout:
-
-1. `simple-v1` is available to Item profiles as deterministic fallback and test oracle.
-2. `fsrs-v1` is enabled for Items and is the primary Item adapter from the first FSRS-capable implementation.
-3. The arena initially runs `simple-v1` and `fsrs-v1` side by side, recording candidates and prediction scores.
-4. `weightedConsensus` stays disabled until enough review history exists and the scoring/reporting UI can explain why a schedule was chosen.
+Algorithm Arena is deferred to a separate feature. It must not add prediction snapshots, lineages, registries, activation pointers, replay machinery, reports, or weighted decision fields to Feature 003. Arena design starts only after the required algorithms and SuperMemo weighting behavior have been verified.
 
 `fsrs-v1` uses SiYuanMemo-owned config under `scheduler/fsrs-v1.json`. It starts with `go-fsrs` default parameters and does not read or mutate SiYuan `riff` flashcard settings.
 
@@ -190,7 +175,7 @@ raw grade 4        -> good
 raw grade 5        -> easy
 ```
 
-The raw grade, mapped adapter rating, and mapping version are all stored in Item review events. Other Item adapters may use different internal scales, but they must accept the same normalized Item input variant and return the same candidate output shape. Topic Adapters receive `TopicNextInput` instead and are excluded from this arena.
+The raw grade, mapped adapter rating, and mapping version are all stored in Item review events. Other Item adapters may use different internal scales, but they must accept the same normalized Item input variant and return the same candidate output shape. Topic Adapters receive `TopicNextInput` instead.
 
 ## Topic Interval Policy
 
@@ -218,29 +203,26 @@ With `topicAFactor = 2.5`, a Topic moves roughly `1 -> 3 -> 8 -> 20 -> 50` days.
 The authoritative internal Interface is defined in `0010-deep-module-interface-design.md`. Scheduler is a concrete internal Module with two operations:
 
 - `BuildQueue(request)`: resolve due eligibility, queue scope, pending introduction, same-day exclusion, and ordering.
-- `Apply(action)`: handle a closed scheduling-action variant and commit the resulting transition through `SchedulingLedger`.
+- `Apply(action)`: handle a closed scheduling-action variant and commit schedule-changing results through `SchedulingLedger`.
 
-Introduction, Topic Next, Item Grade, Postpone, Reschedule, Priority, Remember, Forget, and Dismiss are `Apply` variants. Learning-session navigation belongs to `LearningSession`; Element creation/deletion, Browser queries, note integration, raw index mutation, and algorithm-specific routes are not Scheduler responsibilities.
+Introduction, Topic Next, Item Grade, Postpone, Reschedule, Priority, Remember, Forget, and Dismiss are `Apply` variants. Learning-session navigation and answer visibility belong to `LearningSession`; Element creation/deletion, Browser queries, note integration, raw index mutation, and algorithm-specific routes are not Scheduler responsibilities.
 
 ## Internal Policies
 
-The Scheduler Engine should be implemented as a deep module with internal policies:
+The Scheduler Engine is one deep Module. Its implementation keeps these rules private; the list does not require one type, file, or Interface per rule:
 
 - `QueuePolicy`: selects due ReviewTargets and orders them by due time, priority position, status, type, and future ranking signals.
 - `TopicPolicy`: schedules imported and extracted Topics for progressive reading actions.
-- `AlgorithmRegistry`: owns enabled adapter metadata, versions, parameters, capabilities, and migrations.
-- `MemoryModel`: normalizes review input, calls adapters, and validates candidate memory-state updates.
-- `ArenaPolicy`: scores adapter predictions, updates weights, and selects the adopted schedule under the current decision policy.
+- Item candidate selection: normalizes review input, calls the fixed FSRS and Simple Adapters, validates candidates, and applies primary/fallback/shadow behavior.
 - `PriorityModel`: computes direct and propagated priority position.
 - `PostponePolicy`: computes single-item and batch postpone changes.
 - `SchedulingLedger`: commits immutable scheduler transitions to monthly `.smr`, resolves causal concurrency, and materializes exactly one adopted scheduling chain per Element.
-- `OptimizerStateStore`: stores collection-level algorithm state, such as matrices, learned parameters, or adaptive model weights.
 
 The public interface should remain stable even when these internal policies change.
 
 ## Materialized Element Scheduling State
 
-Current scheduling state is not duplicated inside every `.sme` node. It is materialized in `memo.db` from each Element's causally valid adopted `.smr` chain, together with Element existence, type, relations, resolved Concept defaults, and scheduler configuration. Concurrent superseded, invalid, and duplicate events do not drive this projection. Default resolution follows explicit Element override, primary `boundTo` Concept context, nearest structural Concept, then collection defaults; explicit links never affect scheduling inheritance.
+Current scheduling state is not duplicated inside every `.sme` node. It is materialized in `memo.db` from complete `.smr` history together with Element existence, type, relations, resolved Concept defaults, and scheduler configuration. Concurrent superseded, invalid, and duplicate events do not drive this projection. Default resolution follows explicit Element override, primary `boundTo` Concept context, nearest structural Concept, then collection defaults; explicit links never affect scheduling inheritance.
 
 The materialized row must retain enough state for simple scheduling and later DSR-compatible adapters:
 
@@ -250,8 +232,8 @@ The materialized row must retain enough state for simple scheduling and later DS
   "schemaVersion": 1,
   "processingState": "new",
   "lifecycleState": "memorized",
-  "algorithm": "arena-v1",
-  "activeAlgorithm": "fsrs-v1",
+  "scheduleProfile": { "id": "item-memory-v1", "version": 1 },
+  "decisionPolicy": { "id": "primary-fallback-shadow-v1", "version": 1 },
   "dueAt": "2026-07-19T04:30:00+08:00",
   "priorityPosition": 5000,
   "intervalDays": 0,
@@ -269,8 +251,7 @@ The materialized row must retain enough state for simple scheduling and later DS
   "lastPassed": null,
   "lastReviewKind": null,
   "postponeCount": 0,
-  "algorithmStates": {},
-  "arena": {}
+  "algorithmStates": {}
 }
 ```
 
@@ -290,38 +271,42 @@ The latest graded review event stores raw grade `0..5`; materialized `lastGrade`
 
 `simple-v1` is the deterministic Item fallback and shadow adapter. It exists to keep manual Q/A and cloze Item reviews operable when the primary Item adapter cannot produce a valid candidate. Priority position, pending introduction, fixed postpone, and lifecycle transitions remain Scheduler policies rather than behavior owned by `simple-v1`.
 
-Item review history records the final shape regardless of which compatible Item Adapter wins: timestamp, Element ID, type, previous scheduling state, user-facing rating, raw internal grade `0..5`, derived pass/fail, lapse flag, final-drill flag, mapping version, new scheduling state, `reviewKind = gradeItem`, session ID, and command source. That keeps later migrations and scheduler tests deterministic.
+Item review history records the final shape regardless of which compatible Item Adapter wins: timestamp, Element ID, type, observed `baseSchedulingEventId`, user-facing rating, raw internal grade `0..5`, derived pass/fail, lapse flag, final-drill flag, mapping version, both Adapter candidates, selected result, complete before/after scheduling state, `reviewKind = gradeItem`, session ID, and command source. That keeps projection rebuild and scheduler tests deterministic.
 
 The first serious memory adapter is `fsrs-v1` for Items. It plugs into the adapter interface, maps raw grades into its internal rating scale, keeps its private state under `algorithmStates.fsrs-v1`, and returns candidate `difficulty`, `stability`, `retrievability`, `nextIntervalDays`, and `nextDueAt` values. Its versioned state retains the FSRS card fields required by the selected library version: card state (`new`, `learning`, `review`, or `relearning`), due time, stability, difficulty, elapsed days, scheduled days, repetitions, lapses, and last review time.
 
-`topic-afactor-v1` is the first Topic Adapter. It accepts only `TopicNextInput`, returns a candidate from the previous interval and effective Topic parameters, and writes no raw grade, mapped rating, pass/fail, lapse, or Item-memory state. It does not participate in the Item memory arena. A later Topic-specific arena may compare it with other compatible Topic profiles.
+`topic-afactor-v1` is the first Topic Adapter. It accepts only `TopicNextInput`, returns a candidate from the previous interval and effective Topic parameters, and writes no raw grade, mapped rating, pass/fail, lapse, or Item-memory state.
 
 The adapter must not persist the third-party Go struct by blindly marshaling it. `fsrs-v1` owns a stable versioned state schema and explicitly maps that schema to and from the library's `fsrs.Card`, allowing library upgrades and adapter-state migration without leaking FSRS types through the Scheduler interface. It must be able to run as primary or shadow without changing Topic Reader, Element Browser, or note integration.
 
 A later `dsr-v1` adapter may use D/S/R-compatible state directly, grades or mapped button ratings, forgetting index, interval from stability, repetition/lapse tracking, and post-lapse handling. It should be tested from deterministic review histories.
 
-The future adaptive path should be `adaptive-v1`, not an exact clone of any external application. It may combine several model outputs, collection-level weights, DSR state, smoothing/optimizer data, priority propagation, and algorithm-aware postpone. It should be added only after `simple-v1`, `fsrs-v1`, arena scoring, and adapter state migration prove the Scheduler Engine seam.
+Algorithm Arena remains separate future work and does not constrain this Module beyond reusing the proven Algorithm Adapter seam.
 
 ## SchedulingLedger And Concurrent Reviews
 
 `SchedulingLedger` is an internal deep module of the Learning Engine, not a frontend interface and not a scheduling-algorithm Adapter. It hides monthly file writes, immutable event identity, causal concurrency, branch validation, adopted-chain selection, index projection, and rebuild behind the Scheduler's action-oriented interface.
 
+Every schedule-changing `Apply` runs inside one collection-wide Scheduler write lease nested within the host's bounded Runtime lease. Answer display and learner think time do not hold the write lease. For `GradeItem`, the lease covers target-branch state resolution, Adapter evaluation, candidate selection, event construction, Ledger commit, and projection publication. Other local scheduling writes queue behind it, while post-sync Runtime replacement drains active leases before rebuilding. No public lock, retry token, or additional Scheduler operation is exposed.
+
 Every event that changes an Element's scheduling projection records `baseSchedulingEventId`. This includes Topic `Next`, Item Grade, Postpone, Reschedule, Remember, Forget, Dismiss, and future equivalent actions. The base is the ID of that Element's adopted scheduling terminal observed before the action, or `null` for a root scheduling event. Content-only, move-only, and audit-summary events do not participate in this scheduling chain unless they also change scheduling state.
 
-The commit sequence is fixed:
+The commit sequence inside that write lease is fixed:
 
-1. Read one current adopted scheduling state and terminal event ID.
-2. Run applicable lifecycle policy and every Adapter compatible with the target's schedule profile and review action against that same state.
+1. Read the current adopted scheduling state and terminal event ID for the target.
+2. Run applicable lifecycle logic and the fixed compatible Adapters against that same state.
 3. Construct one transition event containing the observed base, normalized review input, candidates, adopted result, and before/after state.
 4. Atomically replace the target monthly `.smr` under the storage lock.
-5. Reproject `memo.db` and advance the UI only after the event is durable.
+5. Reproject `memo.db` and advance the session only after projection publication succeeds.
+
+The `.smr` replacement is the acceptance point. If projection publication fails afterward, return `projection-refresh-failed` with `reviewAccepted = true` and the event ID so the caller cannot duplicate the accepted grade.
 
 Sync may reveal legal concurrency. Events are first merged by `eventId` set union, independent of file arrival order, then evaluated as a causal graph per Element:
 
 - Different event IDs with one `baseSchedulingEventId` are concurrent sibling branches, not duplicate reviews in sequence.
 - A valid root has a null base. A valid descendant references an existing valid scheduling event for the same Element, contains no cycle, and has a transition compatible with its referenced parent's after-state.
 - A branch terminal is a valid event with no valid child. The terminal with the greatest `(occurredAt, eventId)` tuple wins. Its complete ancestor path is the adopted chain.
-- Only the adopted chain updates current lifecycle, due state, adapter state, arena learning, optimizer input, and queue membership.
+- Only the adopted chain updates current lifecycle, due state, Adapter state, and queue membership.
 - Other valid events remain immutable and derive `concurrent-superseded` status. Malformed, cyclic, missing-base, cross-Element-base, or incompatible events derive `invalid` status. Repeated same-ID/same-payload records derive `duplicate` status.
 - The same event ID with different payloads is never resolved by timestamp. Both raw inputs are retained in local repair history, the identity is excluded from adoption, and the affected Element/month requires explicit repair.
 
@@ -331,67 +316,13 @@ The MVP has one conflict rule and no pluggable `ConflictStrategy`. It never uses
 
 ## Storage Rules
 
-The authoritative file layout and sync policy are defined in `0008-element-storage-sync-recovery-design.md`. Root `.sme` trees define Element existence, type, content, structure, relations, and `processingState`. Monthly `.smr` events define review, scheduling, `lifecycleState`, and deletion history. `memo.db` materializes due queues, priority position, lifecycle and processing projections, full text, relations, backlinks, and current scheduling state under `workspace/temp/siyuanmemo/memo.db`.
+The authoritative file layout and sync policy are defined in `0008-element-storage-sync-recovery-design.md`. Root `.sme` trees define Element existence, type, content, structure, relations, and `processingState`. Complete monthly `.smr` events define review, scheduling, `lifecycleState`, and deletion history. `memo.db` materializes due queues, priority position, lifecycle and processing projections, full text, relations, backlinks, and current scheduling state under `workspace/temp/siyuanmemo/memo.db`.
 
 Review and scheduler actions are appended as immutable events to `workspace/data/storage/siyuanmemo/reviews/YYYY-MM.smr`. Events are partitioned by month, not by device ID. Do not replace history with only the latest state; corrections use compensating events. A scheduling-changing correction also references the adopted terminal it intends to extend through `baseSchedulingEventId`.
 
-Review events must include enough state to reconstruct an adopted branch and audit scheduler decisions:
+Review events must include enough state to reconstruct an adopted branch and audit scheduler decisions. The authoritative `GradeItem` and `NextTopic` JSON shapes are maintained only in `0008-element-storage-sync-recovery-design.md`; this scheduler document does not duplicate them. In summary, a graded event records the observed causal base, normalized outcome, both Adapter candidates, selected result, and before/after scheduling state.
 
-```json
-{
-  "eventId": "20260719050100-aaaaaaa",
-  "occurredAt": "2026-07-19T05:01:00+08:00",
-  "type": "reviewElement",
-  "elementId": "20260719010101-abcdefg",
-  "sessionId": "20260719050000-session",
-  "baseSchedulingEventId": "20260716083000-previous",
-  "reviewKind": "gradeItem",
-  "ratingLabel": "Good",
-  "rawGrade": 4,
-  "passed": true,
-  "lapsed": false,
-  "finalDrillCandidate": false,
-  "ratingMapping": "supermemo-grade-v1",
-  "algorithmDecision": {
-    "policy": "primary",
-    "winner": "fsrs-v1",
-    "enabledAlgorithms": ["simple-v1", "fsrs-v1"]
-  },
-  "algorithmCandidates": [
-    {
-      "algorithm": "simple-v1",
-      "predictedRecallBeforeGrade": null,
-      "nextIntervalDays": 6,
-      "scoreAfterGrade": null
-    },
-    {
-      "algorithm": "fsrs-v1",
-      "predictedRecallBeforeGrade": 0.91,
-      "nextIntervalDays": 8,
-      "scoreAfterGrade": 0.09
-    }
-  ],
-  "sameDayOverride": false,
-  "before": {
-    "lifecycleState": "memorized",
-    "dueAt": "2026-07-19T04:30:00+08:00",
-    "intervalDays": 3,
-    "repetition": 2,
-    "lapses": 0,
-    "topicAFactor": null
-  },
-  "after": {
-    "lifecycleState": "memorized",
-    "dueAt": "2026-07-27T04:30:00+08:00",
-    "intervalDays": 8,
-    "repetition": 3,
-    "lapses": 0,
-    "topicAFactor": null
-  }
-}
-```
-
-Postpone events must also record before/after scheduler state, reason, actor, command source, scope, and postpone count. Batch postpone writes one event per affected Element plus an optional summary event for the subset command.
+Postpone events record the observed base, resulting `scheduleAfter`, reason, actor, command source, scope, and postpone count. They may retain command-specific previous/next values needed to explain the accepted postpone intent, but do not copy a second generic preceding-state snapshot. Batch postpone writes one event per affected Element plus an optional summary event for the subset command.
 
 Algorithm-specific collection state should live outside individual Topic HTML, for example:
 
@@ -402,12 +333,8 @@ workspace/data/storage/siyuanmemo/
     simple-v1.json
     fsrs-v1.json
     topic-afactor-v1.json
-    arena-v1.json
-    dsr-v1.json
-    adaptive-v1.json
+    learning-day.json
 ```
-
-The exact file names can change during implementation, but collection-level optimizer state must be file-first and rebuild/index friendly.
 
 Built-in defaults are only a versioned pre-initialization read fallback. Once persisted, scheduler files are synchronized collection authority; current binary defaults cannot silently replace missing historical configuration.
 
@@ -419,7 +346,7 @@ workspace/temp/siyuanmemo/
   active-session.json
 ```
 
-No scheduler query may depend on temp-only state that cannot be rebuilt after the temp directory is cleared. Losing `active-session.json` loses only the convenience of resuming a scoped queue; completed review outcomes remain in `.smr`, and the default due queue remains rebuildable. `.smr` conflicts merge by immutable `eventId` set union and then resolve one adopted causal chain per Element. Same-ID/different-payload conflicts are preserved for explicit repair instead of silently choosing one version.
+No scheduler query may depend on temp-only state that cannot be rebuilt after the temp directory is cleared. Losing `active-session.json` loses only the convenience of resuming a scoped queue; completed review outcomes remain in `.smr`, and the default due queue remains rebuildable from complete history. `.smr` conflicts merge by immutable `eventId` set union and then resolve one adopted causal chain per Element. Same-ID/different-payload conflicts are preserved for explicit repair instead of silently choosing one version. Missing or corrupt raw history fails affected scheduling closed. Feature 003 retains `.smr` indefinitely and performs no automatic compaction.
 
 ## MVP Acceptance
 
@@ -434,10 +361,10 @@ The first Scheduler core is acceptable when these behaviors work without `riff`:
 - Queue sessions store `ReviewTarget` IDs and can later include `note.block`, `media.audio`, and `media.video` without changing scheduler callers.
 - `GetElementSubset(scope=due)` returns due memorized Topics/Items ordered by due time and priority.
 - `GradeItem` records raw grade `0..5`, derives `passed = grade >= 3`, records lapse/final-drill flags, and updates `dueAt`, interval, repetition/lapse state, and Item algorithm state.
-- `GradeItem` calls compatible Item algorithm Adapters, records every valid candidate, adopts the schedule selected by the Item arena policy, and preserves Adapter-specific state.
+- `GradeItem` calls the FSRS and Simple Adapters, records every valid candidate, applies fixed primary/fallback/shadow behavior, and preserves Adapter-specific state.
 - Every scheduling-changing action records the currently adopted terminal as `baseSchedulingEventId`, commits through `SchedulingLedger`, and advances the queue only after the monthly event write succeeds.
 - Different-ID events sharing one base are retained as concurrent branches; rebuilding from every permutation of the same event set selects the same complete adopted chain and produces the same queue-visible state.
-- Only the adopted chain drives algorithm Adapter state and arena learning. Concurrent superseded, invalid, and duplicate events remain queryable for audit without acting as extra repetitions.
+- Only the adopted chain drives Algorithm Adapter state. Concurrent superseded, invalid, and duplicate events remain queryable for audit without acting as extra repetitions.
 - Active-session Topic `Next` records `reviewKind = nextTopic` and applies Topic interval growth; Topic `Next` outside active learning is navigation only and records no scheduler event.
 - Normal queue construction skips Elements reviewed earlier on the same local learning day unless an explicit override command is used.
 - Pending introduction respects configurable daily/session limits.
@@ -448,11 +375,10 @@ The first Scheduler core is acceptable when these behaviors work without `riff`:
 - `MarkElementDone` finishes a Topic and either dismisses or deletes it according to whether it has children and user confirmation.
 - `DeleteElement` writes local history and an immutable deletion event with ID, type, title, deleted time, and optional replacement metadata before removing the internal subtree or root document tree; it does not create one tombstone file per Element.
 - `GetElementSubset` returns browser-ready subsets for due, all, pending, memorized, dismissed, priority, branch, search, and filter views.
-- Rebuilding `memo.db` from `.sme`, `.smr`, sort, and scheduler configuration files restores queue-visible state plus derived event adoption classifications.
+- Rebuilding `memo.db` from `.sme`, complete `.smr`, sort, and scheduler configuration files restores queue-visible state plus derived event adoption classifications.
 - Default due sessions resume semantically by rebuilding the queue from authoritative state; interrupted scoped queues may resume from the local disposable `workspace/temp/siyuanmemo/active-session.json` snapshot.
 - `fsrs-v1` drives Item scheduling as the primary adapter while `simple-v1` remains available as fallback and shadow comparator.
-- `topic-afactor-v1` drives Topic and explicitly enrolled Concept scheduling; `reviewKind = nextTopic` remains ungraded and outside the Item memory arena.
-- Arena reports can show, at minimum, enabled algorithms, primary algorithm, candidate intervals for recent reviews, and prediction error where predicted recall was available.
+- `topic-afactor-v1` drives Topic and explicitly enrolled Concept scheduling; `reviewKind = nextTopic` remains ungraded.
 
 ## Non-Goals
 

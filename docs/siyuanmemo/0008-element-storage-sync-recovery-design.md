@@ -4,7 +4,7 @@ Date: 2026-07-19
 
 ## Decision
 
-SiYuanMemo adopts SiYuan's file-first, dual-tree storage model for Elements. One root Element document is stored in one `.sme` JSON file, internal Elements are nested inside that file, and root Element documents form a second tree through ID-named directories plus `sort.json`. SQLite remains a rebuildable index. Review and scheduling history is stored as immutable events in monthly `.smr` JSON files.
+SiYuanMemo adopts SiYuan's file-first, dual-tree storage model for Elements. One root Element document is stored in one `.sme` JSON file, internal Elements are nested inside that file, and root Element documents form a second tree through ID-named directories plus `sort.json`. SQLite remains a rebuildable index. Review and scheduling history is stored as immutable events in monthly `.smr` JSON files and retained in full so `memo.db` can always be rebuilt from synchronized authority.
 
 This document supersedes the earlier one-Element-directory layout using `element.json`, `content.html`, `item.json`, and `annotations.json`, the separate SiYuanMemo asset store, and standalone tombstone files described in older design drafts.
 
@@ -29,7 +29,7 @@ workspace/data/storage/siyuanmemo/
     simple-v1.json
     fsrs-v1.json
     topic-afactor-v1.json
-    arena-v1.json
+    learning-day.json
 
 workspace/data/assets/
   <SiYuan-managed assets>
@@ -49,9 +49,13 @@ workspace/history/
 
 All authoritative reads and replacements reuse SiYuan `filelock`; `filelock.WriteFile` already combines its per-path process lock with safer replacement. Complete read-modify-write operations retain SiYuanMemo package/Runtime serialization. Model entry points wait through SiYuan's `waitForSyncingStorages` before bootstrap or Runtime lease acquisition, matching Riff and attribute-view behavior and covering background storage merge that can continue after `BootSyncData` returns. Generic `storage` JSON has no automatic document-history generation. Missing-only bootstrap has no previous source to snapshot; later destructive SiYuanMemo operations explicitly enter the SiYuanMemo history integration described below.
 
-The scheduler and state files are collection-level files, not one file per Element. Their exact filenames may evolve, but they must remain versioned, inspectable, and independent from SiYuan `riff` settings.
+The bounded Runtime lease protects Engine lifetime; an internal collection-wide Scheduler write lease separately serializes schedule-changing `Apply` work. For `GradeItem` and `NextTopic`, latest adopted target state, pure Adapter execution, event serialization, monthly `.smr` replacement, and projection publication occur before that Scheduler lease is released. Answer display and learner think time hold neither scheduling write ownership nor a long-lived Engine pointer. Other scheduling writes wait, and post-sync close/rebuild drains active Runtime leases.
+
+The scheduler configuration files are collection-level files, not one file per Element. Feature 003 fixes Item scheduling to `fsrs-v1` with `simple-v1` fallback/shadow and Topic scheduling to `topic-afactor-v1`; it does not add profiles, policy registries, activation pointers, or Algorithm Arena configuration. `learning-day.json` remains independent mutable collection configuration.
 
 Scheduler configuration follows SiYuan's load/default/save separation. Engine construction and queries build effective configuration from versioned built-in defaults overlaid by valid persisted files and perform no authoritative write. A separate host-owned startup bootstrap runs before API availability only when the SiYuan workspace is writable; it creates missing files through locked writes, skips byte-identical content, and never replaces an existing invalid, unreadable, or unsupported source. SiYuan read-only mode skips bootstrap. Persisted effective configuration is required before the first scheduling-changing event; if `.smr` history exists while required configuration is missing or invalid, reads and diagnostics remain available where safe but new scheduling writes fail until recovery.
+
+Feature 003 retains complete `.smr` history indefinitely and performs no automatic compaction. A Checkpoint becomes justified only after measured full replay is too slow, history compaction is introduced, or the product explicitly requires scheduling continuation after raw-history loss. That future work requires a separate specification.
 
 ## Dual-Tree Model
 
@@ -263,7 +267,7 @@ A Topic event uses the same causal envelope but a different payload:
 }
 ```
 
-The `.smr` event set is authoritative for review and scheduling history. The compatible MVP envelope may retain `type = reviewElement`, but `reviewKind` is a required closed discriminator. An Item review uses `reviewKind = gradeItem`, records raw grade `0..5`, rating mapping, and Item-memory candidates. A Topic review uses `reviewKind = nextTopic`, has no grade or pass/fail fields, and carries the `topic-afactor-v1` transition. A Topic `Next` must never be serialized with the graded Item payload merely to reuse the outer event envelope. A later source-format migration may promote these review kinds to distinct top-level event types without changing their domain semantics.
+The `.smr` event set is authoritative for review and scheduling history. The compatible MVP envelope may retain `type = reviewElement`, but `reviewKind` is a required closed discriminator. An Item review uses `reviewKind = gradeItem`, records raw grade `0..5`, rating mapping, the FSRS and Simple candidates, the selected result, and complete before/after scheduling state. A Topic review uses `reviewKind = nextTopic`, has no grade or pass/fail fields, and carries the `topic-afactor-v1` transition. A Topic `Next` must never be serialized with the graded Item payload merely to reuse the outer event envelope. A later source-format migration may promote these review kinds to distinct top-level event types without changing their domain semantics.
 
 `memo.db` materializes current due dates, lifecycle state, schedule profile and Adapter state, priority position, queue eligibility, and summary statistics from one causally valid adopted scheduling chain per Element together with `.sme` Elements and scheduler configuration. Events outside the adopted chain remain history but do not act as additional repetitions.
 
@@ -283,7 +287,7 @@ Element type determines its default schedule profile, while explicit enrollment 
 | Concept | `none` by default | explicit enrollment selects `topic-afactor-v1` and `NextTopic` |
 | Future target kinds | declared future profile | profile-declared action |
 
-`topic-afactor-v1` starts with an effective A-Factor of `2.5`, resolved from an Element override, primary Concept context, structural Concept, then collection defaults. Its normal transition is `nextInterval = previousInterval * effectiveAFactor`, constrained by Topic-specific minimum and maximum interval settings; an explicit skip interval is a separate Topic policy input. It does not accept Item grades or participate in the Item memory arena. A future Topic-specific arena may compare only compatible Topic schedule profiles.
+`topic-afactor-v1` starts with an effective A-Factor of `2.5`, resolved from an Element override, primary Concept context, structural Concept, then collection defaults. Its normal transition is `nextInterval = previousInterval * effectiveAFactor`, constrained by Topic-specific minimum and maximum interval settings; an explicit skip interval is a separate Topic policy input. It does not accept Item grades.
 
 The kernel's internal `SchedulingLedger` is the sole owner of this field and its semantics. It commits monthly events, de-duplicates input, builds a causal graph per Element, selects the adopted branch, updates `memo.db`, and rebuilds the projection. Frontend code and algorithm Adapters see one current state and normalized action input; they never choose branches or inspect synchronization conflicts.
 
@@ -296,19 +300,19 @@ After loading or merging events, the ledger applies these order-independent rule
 5. A valid event with no valid child is a terminal. The terminal with the greatest `(occurredAt, eventId)` tuple wins deterministically, and that terminal plus all of its ancestors is the adopted chain.
 6. A later child can extend a previously superseded branch. The ledger then compares complete branch terminals again and may adopt that entire branch; it never adopts an isolated descendant without its ancestors.
 
-Only the adopted chain drives lifecycle, due dates, adapter state, arena learning, optimizer input, and queue membership. Other valid graph nodes remain immutable history. `memo.db` may classify ingested records as `adopted`, `concurrent-superseded`, `invalid`, or `duplicate`, but those labels are derived and must never be written back into `.smr`.
+Only the adopted chain drives lifecycle, due dates, Adapter state, and queue membership. Other valid graph nodes remain immutable history. `memo.db` may classify ingested records as `adopted`, `concurrent-superseded`, `invalid`, or `duplicate`, but those labels are derived and must never be written back into `.smr`.
 
 The MVP has one fixed adoption rule, no `ConflictStrategy` Adapter, no device-based winner, and no ordinary conflict dialog. Active learning session recovery is separate: a local session snapshot can restore scoped-queue navigation but cannot select or override a scheduling branch.
 
 ## Write And Move Semantics
 
-All Element mutations pass through the kernel Learning Engine and its storage queue. Scheduling-changing mutations additionally pass through `SchedulingLedger`, which writes a fully serialized monthly `.smr` by atomic replacement under the storage lock before publishing the new projection. UI code must never write `.sme`, `.smr`, `sort.json`, or `memo.db` directly.
+All Element mutations pass through the kernel Learning Engine and its storage queue. Scheduling-changing mutations additionally hold the collection Scheduler write lease and pass through `SchedulingLedger`, which writes a fully serialized monthly `.smr` by atomic replacement under the storage lock before publishing the new projection and releasing the lease. The target's `baseSchedulingEventId` remains the state observed when its action began. UI code must never write `.sme`, `.smr`, `sort.json`, or `memo.db` directly.
 
 Before writing, the store serializes and validates the complete intended result for every affected authority file. Destructive operations then call the narrow host `HistorySnapshotWriter` once with all existing affected `.sme`, `.smr`, `sort.json`, configuration, or root-directory paths. Its production Adapter reuses SiYuan's workspace history root and timestamped operation layout; its deterministic test Adapter writes under a temporary workspace. Snapshot failure aborts before the first authority write. This is a real SiYuan host seam, not a public Engine family or a generic history service.
 
 Within one `.sme`, a move changes one in-memory tree and writes one root file. If the move enters, leaves, or reorders a mixed root-boundary sibling set, the same logical transaction also updates `sort.json`. A cross-root move removes the subtree from the source tree, inserts it into the target tree, preserves every moved Element ID, and runs under the serialized Element storage queue. Like SiYuan cross-document transactions, every authority file is replaced safely on its own but the group is not physically atomic.
 
-After the complete pre-image snapshot succeeds, cross-root move, promotion, and demotion write additive/destination authority first, destructive/source authority second, affected `sort.json` last, and `memo.db` only after all source writes succeed. For `A.sme -> B.sme`, the fixed order is `B.sme`, `A.sme`, `sort.json`, then projection publication. A mid-write failure can therefore leave a detectable duplicate rather than remove the only current copy. The implementation never chooses source-first ordering merely to reduce temporary duplication.
+After the complete pre-image snapshot succeeds, cross-root move, promotion, and demotion write additive/destination authority first, destructive/source authority second, affected `sort.json` last, and `memo.db` only after all source writes succeed. For an internal subtree move `A.sme -> B.sme`, the fixed order is `B.sme`, `A.sme`, `sort.json`, then projection publication. The operation holds the Element storage queue and Scheduler write lease in the implementation's fixed local order. A mid-write failure can therefore leave a detectable duplicate rather than remove the only current content. The implementation never chooses source-first ordering merely to reduce temporary duplication.
 
 If an authority write fails after any earlier authority write completed, the command returns stable `element-write-partial`; it does not attempt an automatic inverse write from history. The Runtime stops serving the prior projection, waits for the triggering lease to release, and performs one host-owned rebuild from the actual files. A successful rebuild may publish isolated duplicate/incomplete diagnostics; a failed rebuild retains `projection-rebuild-failed`. No request sees the old in-memory tree as if the complete command succeeded.
 
@@ -340,27 +344,35 @@ Formula source remains editable in `.sme` payloads as normalized TeX, MathML, or
 
 `workspace/temp/siyuanmemo/memo.db` is a disposable materialized index. It stores Element-to-root/path lookup, derived parent/root relationships, full-text search, explicit references and backlinks, current schedule state, queue eligibility, priority position, summary statistics, and derived adoption classification for ingested scheduler events.
 
-Startup indexing scans `.sme`, `.smr`, `sort.json`, and effective scheduler configuration. A missing, corrupt, or schema-incompatible `memo.db` triggers a rebuild from source files. Engine/index opening itself never persists missing scheduler defaults; that responsibility belongs only to the earlier writable host bootstrap.
+Startup indexing scans `.sme`, complete `.smr` history, `sort.json`, and effective scheduler configuration. A missing, corrupt, or schema-incompatible `memo.db` triggers a rebuild from these synchronized sources. Engine/index opening itself never persists missing scheduler defaults; that responsibility belongs only to the earlier writable host bootstrap.
 
-Projection replacement follows SiYuan's index lifecycle and is visible only after complete success. CGO commits the complete replacement in one SQLite transaction. Non-CGO builds a separate complete next value, atomically writes it, and only then swaps the in-memory snapshot. If a scheduling-changing command committed its authoritative event before publication failed, that triggering command returns `projection-refresh-failed`, `reviewAccepted = true`, and the event ID. The Engine then returns stable `projection-rebuild-failed` for every subsequent query and learning action until restart or an explicit rebuild succeeds. It does not serve the previous, empty, or partial projection, and SiYuanMemo adds no stale-projection mode, fallback database, or freshness UI.
+Projection replacement follows SiYuan's index lifecycle and is visible only after complete success. CGO commits the complete replacement in one SQLite transaction. Non-CGO builds a separate complete next value, atomically writes it, and only then swaps the in-memory snapshot. If a scheduling-changing command committed its authoritative event before projection publication failed, that triggering command returns `projection-refresh-failed`, `reviewAccepted = true`, and the event ID. The Engine then returns stable `projection-rebuild-failed` for subsequent queries and learning actions until a complete rebuild succeeds. It does not serve the previous, empty, or partial projection, and SiYuanMemo adds no stale-projection mode, fallback database, or freshness UI.
 
 Following SiYuan's model-level full-reindex ownership, `symemoRuntime` owns projection bootstrap, the current Engine handle, failure latching, and internal close/recreate rebuild. Its state is only `uninitialized | available | unavailable` in memory. Ordinary requests in `unavailable` return `projection-rebuild-failed` without reopening; internal rebuild publishes one replacement Engine only after complete construction, and workspace restart resets the Runtime. Projection refresh remains package-internal, with no sixth Engine family, public rebuild route, or MVP UI.
 
-API and other host callers execute exactly one Engine operation through a bounded Runtime lease instead of retaining `*Engine`. Close/rebuild marks the Runtime draining and unavailable, rejects new leases, waits for active leases to reach zero, and only then closes the old Engine. The triggering accepted-event call returns its `projection-refresh-failed` recovery facts before releasing; rebuild cannot pass the drain barrier until that response path has finished. Lease state is local process memory and never participates in sync.
+API and other host callers execute exactly one Engine operation through a bounded Runtime lease instead of retaining `*Engine`. Close/rebuild marks the Runtime draining and unavailable, rejects new leases, waits for active leases to reach zero, and only then closes the old Engine. The triggering accepted-event call returns its `projection-refresh-failed` facts before releasing; rebuild cannot pass the drain barrier until that response path has finished. Schedule-changing operations additionally serialize behind the Engine-internal Scheduler write lease; this is not a second host lifecycle mechanism. Both lease states are local process memory and never participate in sync.
 
 Isolated source failures remain different from a rebuild failure. A malformed, unreadable, duplicate, or unsupported source that can be excluded safely is represented by a deterministic diagnostic in the complete projection while unrelated valid Elements remain queryable. Failure to construct or publish that complete result makes the whole Engine unavailable. All authoritative `.sme`, `.smr`, sort, scheduler, asset, and `.sy` bytes remain unchanged by either outcome.
 
-After SiYuan sync, `processSyncMergeResult` detects any upsert, remove, or conflict under `/storage/siyuanmemo/` and sets `needReloadSymemo`, but it does not rebuild SiYuanMemo at the earlier `needReloadFlashcard -> LoadFlashcards` position. The current fork clears synchronized-storage state and then calls `incReindex(upserts, removes)`, whose remove-before-upsert order repairs native block-tree locations for moved or deleted `.sy` files. Only after that native incremental reindex completes may the model hook perform SiYuanMemo type-aware recovery and ask `symemoRuntime` for one complete drain/close/recreate rebuild. This ordering prevents Block-backed projections from observing pre-reindex native locations. The MVP adds no incremental threshold and preserves one all-or-nothing projection publication path.
+A missing or corrupt `.smr` partition means current scheduling state cannot be proven from complete authority. Feature 003 fails closed for affected scheduling work and requires explicit recovery of the raw file; it does not invent a continuation baseline. Content, tree, relation, backlink, and other schedule-independent reads remain available where the failure can be isolated safely.
 
-The post-sync hook is host maintenance, not a sixth Engine family or a frontend command. It does not call `waitForSyncingStorages`, because it runs inside sync result processing after the synchronized files have been selected and after native `incReindex` has completed. Normal facade calls still wait before leases. If Runtime is still `uninitialized` during boot sync, the hook performs no Engine open and the waiting `InitSymemo` later initializes from the merged files. If Runtime is `available` or `unavailable`, the hook may attempt one host-owned replacement. Recovery or rebuild failure is logged and leaves Runtime unavailable without retroactively changing SiYuan's completed sync result.
+The following repository-sync hook and type-aware recovery contract is retained for a later sync-integration feature. Feature 003 may keep its storage compatible with this contract but does not implement the hook, `SyncRecovery`, or post-sync Runtime replacement.
+
+Before a full repository sync can replace synchronized SiYuanMemo files, the host places `symemoRuntime` behind one sync gate: it rejects new Engine leases, drains in-flight operations, and keeps the Runtime unavailable. The Engine-internal Scheduler lease alone is insufficient because DejaVu synchronization is outside that Module. This ordering gives a deterministic local result when a grade overlaps sync without claiming any cross-device transaction.
+
+After DejaVu completes merge and native history generation, recovery discovery runs inside `processSyncMergeResult` before its no-upsert/no-remove/no-conflict early return. It unions relevant paths from `mergeResult.Upserts`, `mergeResult.Removes`, and `mergeResult.Conflicts` with files physically present under the exact `workspace/history/<mergeResult.Time>-sync/storage/siyuanmemo/` directory. This history scan is mandatory: DejaVu can create a losing-file snapshot while omitting `MergeResult.Conflicts`, including when the cloud object already exists in the local object store. Relevant discovery sets `needReloadSymemo` even when the three result lists are otherwise empty.
+
+The current fork clears synchronized-storage state and then calls `incReindex(upserts, removes)`, whose remove-before-upsert order repairs native block-tree locations for moved or deleted `.sy` files. Only after that native incremental reindex completes should one deep internal `SyncRecovery` Module perform deterministic type-aware repair, after which `symemoRuntime` closes/recreates the Engine and completely rebuilds `memo.db`. The gate reopens only after valid scheduler authority and one complete projection are published. This ordering prevents Block-backed projections from observing pre-reindex native locations and prevents any query or schedule-changing write from observing partially recovered authority. The later sync feature needs no incremental threshold and preserves one all-or-nothing projection publication path.
+
+The sync gate, discovery, recovery, and rebuild hooks are host maintenance, not a sixth Engine family or frontend command. Normal facade calls still honor `waitForSyncingStorages` before leases, but that wait is not cited as the pre-replacement ordering guarantee. If Runtime is still `uninitialized` during boot sync, recovery may repair authority without opening an Engine and the waiting `InitSymemo` later initializes from the merged files. If Runtime was open, the host attempts one replacement. Recovery or rebuild failure is logged and leaves Runtime unavailable without retroactively changing SiYuan's completed repository sync result.
 
 No queue or backlink query may depend on state that exists only in `memo.db` and cannot be reconstructed.
 
 ## Local Learning Session Recovery
 
-Review results and scheduling transitions are authoritative only after their immutable `.smr` events are written. The UI advances from a Topic `Next` or Item grade only after that write succeeds. An activity session never owns completed review state.
+Review results and scheduling transitions are accepted only after their immutable `.smr` events are written. Normal UI advancement waits for projection publication; a later publication failure reports the accepted event ID so the action is not submitted again. An activity session never owns completed review state.
 
-The default due `IncrementalLearningQueue` is rebuilt from `.sme`, `.smr`, scheduler configuration, and same-learning-day processing state. It does not persist or synchronize an exact queue cursor.
+The default due `IncrementalLearningQueue` is rebuilt from `.sme`, complete `.smr` history, scheduler configuration, and same-learning-day processing state. It does not persist or synchronize an exact queue cursor.
 
 Filtered branches, temporary practice, and other scoped queues may store one lightweight `workspace/temp/siyuanmemo/active-session.json` snapshot for same-device restart recovery. Its versioned shape contains only the session ID, queue type, scope or filter definition, remaining target IDs, current target ID, and timestamps. Recovery reconciles those IDs against current authoritative state and drops targets that are completed, deleted, dismissed, or ineligible.
 
@@ -368,14 +380,16 @@ The snapshot is disposable, is not source data, and does not participate in SiYu
 
 ## Sync Conflict Policy
 
-Sync uses SiYuan's existing data repository and file-level conflict detection. SiYuanMemo adds type-aware recovery after merge:
+This section defines later sync-integration behavior, not Feature 003 implementation scope.
 
-- `.sme`: preserve both versions. Keep the selected version at the original path and create a separate conflict root from the other version with regenerated IDs plus conflict provenance, following SiYuan's conflicted-document approach. Never silently merge mutable HTML trees.
-- `.smr`: parse both valid versions and merge by immutable `eventId` set union, then sort deterministically for serialization. Canonically identical same-ID records collapse as duplicates. Different IDs with the same `baseSchedulingEventId` remain legal concurrent siblings and are projected through the adopted-chain rule. If the same `eventId` has different payloads, preserve both raw inputs in local conflict history, exclude that identity from adoption, mark the month as requiring repair, and do not silently choose one.
+Sync uses SiYuan's existing data repository and file-level conflict detection. DejaVu selects complete files by path; it does not merge JSON fields, MsgPack records, scheduler settings, or `.smr` events. Ordinary bidirectional same-path conflicts generally retain the selected current file and place the other version in native `-sync` history, subject to DejaVu's modification-time heuristic; download-only sync instead restores the cloud file and preserves the local version in history. SiYuanMemo then adds the following idempotent type-aware domain recovery after native selection:
+
+- `.sme`: keep the DejaVu-selected version at the original path and never structurally merge mutable HTML trees. SiYuan's current global `Conf.Sync.GenerateConflictDoc` value controls whether recovery also materializes the losing valid history version as a visible conflict root. When enabled, regenerate IDs and internal references consistently, attach conflict provenance, and use a stable key containing original path, losing content digest, and merge time so retries do not duplicate the root. When disabled, perform no `.sme` authority write for the losing tree: native `-sync` history remains recoverable and `SyncRecovery` returns a typed non-blocking local diagnostic. The setting is sampled for that recovery; enabling it later does not retroactively scan old history to create conflict roots. This mirrors SiYuan's visible-conflict-document choice, although applying it to `.sme` is SiYuanMemo behavior because the native implementation handles only `.sy`.
+- `.smr`: parse current and native-history versions and merge by immutable `eventId` set union, then sort deterministically for serialization. Canonically identical same-ID records collapse as duplicates. Different IDs with the same `baseSchedulingEventId` remain legal concurrent siblings and are projected through the adopted-chain rule. If the same `eventId` has different payloads, preserve both raw inputs in local conflict history, exclude that identity from adoption, and close the smallest provable scheduling scope pending repair. If complete raw history cannot be recovered, affected scheduling fails closed.
 - `sort.json`: merge known IDs where possible. Its ranks cover root documents and internal children participating in mixed sibling sets. Loss or corruption affects order only; scanning `.sme` files and their internal arrays reconstructs existence and a deterministic fallback order, and missing or duplicate ranks are normalized after recovery.
-- collection and scheduler settings: preserve conflicting files in history before selecting a current version; selecting configuration must never synthesize a review or grade.
+- other mutable collection settings: accept DejaVu's selected complete file, retain losing history, validate it as one value, and never synthesize a review or grade.
 
-DejaVu already copies every conflicting source to `workspace/history/<timestamp>-sync/<original-relative-path>` before restoring the selected current file. SiYuanMemo consumes those preserved `storage/siyuanmemo/...` snapshots from the model hook instead of creating a parallel conflict directory. The conflict policy does not use device-specific files or assume that a SiYuan device ID is permanent.
+DejaVu creates native losing-file snapshots at `workspace/history/<timestamp>-sync/<original-relative-path>` as part of its file-level merge. A snapshot may exist even when `MergeResult.Conflicts` is empty, so `SyncRecovery` consumes the physical `storage/siyuanmemo/...` subtree selected by `mergeResult.Time` instead of relying on that list or creating a parallel conflict directory. The semantic rules above are SiYuanMemo extensions layered after native file selection; they must not be described as DejaVu behavior. They do not use device-specific files or assume that a SiYuan device ID is permanent.
 
 ## History And Recovery
 
@@ -384,6 +398,8 @@ SiYuanMemo history follows SiYuan's existing snapshot layout at `workspace/histo
 The Adapter validates that every requested source lies under SiYuanMemo authority, copies directories recursively through SiYuan's locked file helpers, and returns an error if any pre-image cannot be captured. The Element storage implementation owns which paths belong to the transaction and the destination-first write plan; the Adapter owns only native history placement and snapshot completion. No UI caller writes history directly.
 
 Startup and post-sync recovery never replay history, complete a move, or roll back files by guessing user intent. They validate the actual authority currently on disk and publish deterministic diagnostics for duplicate IDs, missing roots, incomplete event/source combinations, and stale sort entries. A later explicit repair workflow may inspect or restore a selected native history entry. SiYuanMemo adds no WAL, two-phase commit, per-operation journal, automatic startup rollback, or separate history root.
+
+`SyncRecovery` is one concrete deep internal Module at the model/SiYuanMemo seam. Its narrow operation accepts the completed merge time, discovered relevant paths, and the host-resolved `GenerateConflictDoc` value, then returns one recovery outcome with typed diagnostics and domain availability. Its implementation alone scans the exact native history directory, performs `.smr` union, conditionally creates idempotent `.sme` conflict roots, normalizes `sort.json`, validates fixed scheduler configuration, and applies locked canonical replacements. Its outcome closes only the smallest scheduling scope that cannot be proven from complete authority. These helpers are not public Engine operations, caller workflows, or Adapter seams.
 
 On startup or after sync, validation checks at least:
 
@@ -395,8 +411,9 @@ On startup or after sync, validation checks at least:
 - valid scheduling bases, same-Element causal links, acyclic branches, and compatible parent/child transitions;
 - references to missing Elements;
 - missing root-document ancestor `.sme` files;
-- stale `sort.json` entries.
-- invalid Block-backed node IDs and encrypted Block-backed material, retained as visible Elements with blocked-material diagnostics.
+- stale `sort.json` entries;
+- invalid Block-backed node IDs and encrypted Block-backed material, retained as visible Elements with blocked-material diagnostics;
+- missing or corrupt `.smr` partitions required to rebuild current scheduling state.
 
 Unsupported future specs open read-only. Invalid or uncertain existing files are not automatically overwritten during indexing. Conclusively absent root-document parents are the narrow exception: the read-only phase diagnoses them, and the later writable workspace load/repair phase creates empty `Untitled` Topic roots parent-first before rebuilding the projection. Other recovery operates from history or an explicit repair action.
 
@@ -408,7 +425,7 @@ The failure mode is explicit and closed: no decryption, encrypted index, key-man
 
 ## File Count Consequence
 
-File growth is bounded primarily by root Element documents, months of review history, shared assets, and a small number of collection state files. Extracted Topics and Items nested inside an existing root do not create extra filesystem files. Users can promote a large internal subtree to a new root `.sme` when independent document boundaries, smaller rewrites, or separate root organization are useful.
+File growth is bounded primarily by root Element documents, months of review history, scheduler configuration, and shared assets. Extracted Topics and Items nested inside an existing root do not create extra filesystem files. Users can promote a large internal subtree to a new root `.sme` when independent document boundaries, smaller rewrites, or separate root organization are useful.
 
 This deliberately accepts whole-root rewrites in exchange for far fewer files, coherent subtree recovery, and behavior aligned with SiYuan `.sy` documents.
 
@@ -428,12 +445,12 @@ The implementation should reuse or closely follow these existing repository patt
 
 ## Invariants
 
-1. Files and immutable events are source data; `memo.db` is disposable.
+1. Files and immutable events are synchronized source data; `memo.db` is disposable.
 2. One root Element document owns one `.sme`; internal Elements do not own files.
 3. Root document hierarchy and internal Element hierarchy are separate storage trees projected into one user-facing Elements tree.
 4. Promotion leaves no mount placeholder.
 5. Element IDs survive moves and promotion; conflict copies receive new IDs.
-6. Scheduling and review history is authoritative in monthly `.smr` events.
+6. Scheduling and review history is authoritative in complete monthly `.smr` events.
 7. Persistent event partitioning never depends on device ID.
 8. Assets live in SiYuan's global asset store and are considered referenced by both `.sy` and `.sme`.
 9. Internal children and child root documents can be freely interleaved through shared `sort.json` ranks without changing structural ownership.
@@ -445,4 +462,6 @@ The implementation should reuse or closely follow these existing repository patt
 15. A disposable projection is served only after complete publication; rebuild failure blocks Engine queries and learning actions instead of exposing an old or partial projection.
 16. Block-backed tree queries use one live batch block-tree lookup; only opening or reviewing one target uses SiYuan's native reindex-aware load, and no SiYuanMemo projection rebuild scans the filesystem once per missing reference.
 17. Invalid and encrypted Block-backed material blocks material-dependent capabilities, not Element discovery; the Element remains visible with one stable diagnostic and no material tri-state value.
-18. Destructive multi-file operations snapshot every existing pre-image before writing, write destination before source and sort before projection, and recover partial failure through Runtime rebuild plus explicit native history repair rather than automatic rollback or a private transaction journal.
+18. Destructive multi-file operations snapshot every existing pre-image before writing, copy destination content before removing the source, write sort before projection, and recover partial failure through Runtime rebuild plus explicit native history repair rather than automatic rollback or a private transaction journal.
+19. An accepted scheduling event is published before `memo.db`; a later projection failure cannot make the grade retryable.
+20. Feature 003 retains `.smr` payloads indefinitely and performs no automatic history compaction.

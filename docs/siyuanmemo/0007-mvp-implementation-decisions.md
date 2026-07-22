@@ -17,7 +17,7 @@ This document records the MVP implementation defaults that should remove ambigui
 7. **Topic Done follows the SuperMemo-like rule.** If a Topic has child Elements, `Done` asks to dismiss the parent. If it has no child Elements, `Done` asks whether to delete it.
 8. **Element note references start with SendToNote.** MVP does not need native Protyle `@` autocomplete. Element note anchors are created by explicit `SendToNote` actions.
 9. **Deletion writes history and an immutable event.** Deleting an Element snapshots affected roots to local history and appends minimal deletion metadata to the monthly `.smr`; it does not create one tombstone file per Element.
-10. **The first vertical slice is backend-first.** Build seeded Elements, Scheduler, FSRS adapter, arena candidate recording, Element Browser, and embedded Learn first. Real HTML import and richer Topic Reader actions can follow after the learning loop works.
+10. **The first vertical slice is backend-first.** Build seeded Elements, Scheduler, FSRS candidate recording, and the learning loop before Browser or production UI. Real HTML import and richer Topic Reader actions can follow after the learning loop works.
 11. **Queue names follow the existing plugin vocabulary.** Default Learn uses `IncrementalLearningQueue` / `incremental-learning`. Other reserved queue identifiers are `RetrievalPracticeQueue` / `retrieval-practice`, `FilterGroupQueue` / `filter-group`, `FinalDrillQueue` / `final-drill`, `NeuralRoamQueue` / `neural-roam`, and `LeechReviewQueue` / `leech`.
 12. **Queues use ReviewTarget, not only Element.** MVP targets include `element.topic`, `element.item`, `element.concept`, and `note.block`; future targets may include audio/video without changing scheduler callers.
 13. **Block-to-Topic is explicit and live.** One whole SiYuan block with no back-side answer creates a Block-backed Topic through `CreateTopicFromBlock`; its `.sme` payload stores `material.kind = siyuanBlock` and the stable block ID while Protyle continues to edit the live `.sy` material. Prompt/answer or cloze intent creates an Item snapshot through `CreateItemFromBlock` or `CreateClozeItemFromBlock`. MVP does not define a live selected-range Topic contract, and the source `.sy` block is never rewritten by Element creation.
@@ -25,7 +25,7 @@ This document records the MVP implementation defaults that should remove ambigui
 15. **Review history uses monthly `.smr`.** Immutable scheduling and lifecycle events are partitioned by month, not device ID, and merge by `eventId` set union.
 16. **The unified Elements tree supports free mixed ordering.** At a root-document boundary, `sort.json` assigns one shared rank space to direct internal children and child root documents. The UI may drag either storage kind into any sibling position without creating mounts or changing Element identity.
 17. **SiYuan assets are shared.** Topic and Item payloads reference `workspace/data/assets/`; asset indexing and cleanup scan both `.sy` and `.sme`.
-18. **Indexes are disposable.** `workspace/temp/siyuanmemo/memo.db` is rebuilt from `.sme`, `.smr`, sort, and scheduler configuration files at startup or after incompatible sync changes.
+18. **Indexes are disposable.** `workspace/temp/siyuanmemo/memo.db` is rebuilt from `.sme`, the complete retained `.smr` event set, sort, and scheduler configuration files at startup or after incompatible sync changes.
 19. **Encrypted notebooks fail closed.** MVP block conversion, note integration, asset promotion, and indexing must reject operations that would persist decrypted encrypted-notebook content into the plaintext Element store.
 20. **Element workflow state is orthogonal.** `.sme` stores `processingState = new | reading | processed`; monthly lifecycle events project `lifecycleState = pending | memorized | dismissed`; algorithm states remain versioned adapter-private data. Dismiss preserves schedule state, Remember restores it and surfaces overdue targets, and Forget resets current schedule state while retaining immutable history.
 21. **Add new has one contextual binding.** A Topic created by `AddNewTopic` may store at most one `boundTo` relation to a Concept or Element. It is not structural and is not a backlink. Rebinding replaces it; additional associations are explicit Element links and appear through normal backlinks.
@@ -37,10 +37,13 @@ This document records the MVP implementation defaults that should remove ambigui
 27. **Scheduler has two operations.** `BuildQueue` constructs ReviewTarget plans and `Apply` commits a closed scheduling-action variant through `SchedulingLedger`. Scheduler does not own Element deletion, Browser queries, session UI state, or note integration.
 28. **Topic material processing is internal.** HTML cleaning, selection extraction, stable nodes, and annotation remapping have no separate action Interface. Create workflows use `CreateElement`, persistence workflows use `ChangeElement`, and fine-grained TinyMCE edits remain local until Save Topic HTML.
 29. **Only real variation gets Adapters.** The algorithm seam exposes Describe, Initialize, Predict, Review, and Migrate for `simple-v1`, `fsrs-v1`, and `topic-afactor-v1`, with declared target/action compatibility. SiYuan integration uses narrow `BlockReferenceReader`, `BlockSnapshotReader`, `NoteAnchorWriter`, `AssetStore`, and `HistorySnapshotWriter` Adapters. Concrete Ledger and query/index Modules do not receive hypothetical Go interfaces.
-30. **Element types select different schedule profiles.** Items use `fsrs-v1` with `simple-v1` fallback/shadow and accept `GradeItem(0..5)`. HTML-backed and Block-backed Topics use ungraded `topic-afactor-v1` and accept `NextTopic`. Concepts use `none` until explicitly enrolled, then use the Topic profile. Topic candidates never enter the Item memory arena.
+30. **Element types select different scheduling paths.** Items use `fsrs-v1` with `simple-v1` fallback/shadow and accept `GradeItem(0..5)`. HTML-backed and Block-backed Topics use ungraded `topic-afactor-v1` and accept `NextTopic`. Concepts use `none` until explicitly enrolled, then use the Topic path. No profile registry or active-policy pointer is required for these fixed MVP choices.
 31. **Scheduler defaults follow SiYuan's configuration lifecycle.** Engine construction and queries compose versioned built-in defaults with valid persisted scheduler files and never write authority. A separate host-owned startup bootstrap persists only missing files before API availability when SiYuan is writable, skips read-only mode and byte-identical data, and never replaces an invalid existing file. Persisted configuration is required before the first scheduling-changing event; missing historical authority blocks new learning writes.
 32. **SiYuan is the architectural skeleton.** Incremental-learning semantics are implemented through SiYuan's kernel ownership, workspace lifecycle, file/index split, sync/recovery, history/assets, and UI integration patterns. Projection failure is latched and rebuilt by the model-owned Runtime like a SiYuan full reindex; it is not a sixth Engine family or public maintenance route.
 33. **Runtime drains Engine operations.** API handlers execute one Engine call through a bounded model Runtime lease and retain no naked Engine pointer. Close/rebuild rejects new work, waits for active operations, and only then closes the old Engine, matching SiYuan's model-level serialization responsibility.
+34. **Scheduling writes remain locally serialized.** A schedule-changing `Scheduler.Apply` preserves the target base observed by the learner and serializes Adapter calculation, Ledger commit, and projection publication inside the existing Runtime/Ledger ownership. Learner think time holds no write lock, and no public lock or retry-token Interface is added.
+35. **Feature 003 retains complete review history.** Monthly `.smr` payloads are retained indefinitely by default. Feature 003 adds no compaction, synchronized Checkpoint, evidence manifest, or continuation baseline.
+36. **Future recovery machinery requires evidence.** Checkpoints may be specified only after measured full-replay cost, explicit `.smr` compaction, or a product requirement to continue scheduling after raw-history loss. Algorithm Arena may be specified only after its required algorithms and weighting behavior are verified. Neither future mechanism constrains Feature 003 storage or event fields. Removed design research is preserved in `0012-deferred-arena-and-checkpoint-research.md` as a non-authoritative archive.
 
 ## MVP Build Slice
 
@@ -85,6 +88,23 @@ The feature includes prepared concurrent-event fixtures so Ledger refresh, compl
 
 The feature excludes production UI, Topic behavior, Element creation/import, tree mutation, Browser, scoped-session recovery, lifecycle/postpone actions, block/note/assets integration, and advanced queue or algorithm behavior. Named backend routes and Engine tests are the tracer's outer test surface.
 
+## Feature 003 Minimal Boundary
+
+Feature 003 builds on the completed Item learning core and read-only Element tree. It adds one backend-only SuperMemo-aligned daily learning loop:
+
+```text
+Learning Day + Midnight Shift
+  -> Outstanding stage over due Memorized Topics and Items
+  -> optional confirmed Pending stage over the global Pending order
+  -> optional confirmed Final Drill stage over Items admitted by grades below Good
+  -> Topic Next through topic-afactor-v1
+  -> Item Grade through existing fsrs-v1 + simple-v1 fallback/shadow
+  -> monthly .smr commit
+  -> memo.db rebuild from complete retained authority
+```
+
+The stage order, confirmation transitions, same-day exclusion, Pending introduction, and schedule-neutral dynamic Final Drill membership are in scope. Browser/subset learning, production UI, actual sync-hook integration, history compaction, Checkpoints, scheduler profile registries, Algorithm Arena, additional memory algorithms, R-Metric, and neural roam are separate later features. The first Feature 003 specification must not create files, fields, Modules, Interfaces, or tests solely for those deferred capabilities.
+
 ## Implementation Placement
 
 The backend implementation should live in a new SiYuanMemo kernel package rather than inside `riff`:
@@ -105,8 +125,6 @@ kernel/model/symemo/
     scheduler.go
     scheduling_ledger.go
     adapter.go
-    registry.go
-    arena.go
     queue_policy.go
     queue_type.go
     review_target.go
@@ -131,4 +149,4 @@ Block-to-Element workflows use two distinct SiYuan-side Adapters. `BlockReferenc
 
 ## Non-Goals
 
-The MVP does not include advanced FSRS tuning UI, optimizer training, weighted arena consensus, runtime third-party adapter loading, image occlusion cards, automatic Topic splitting, automatic note-to-card generation, native Protyle `@Element` autocomplete, or full final drill screens.
+The MVP does not include advanced FSRS tuning UI, optimizer training, weighted Algorithm Arena consensus, runtime third-party adapter loading, image occlusion cards, automatic Topic splitting, automatic note-to-card generation, native Protyle `@Element` autocomplete, or full final drill screens.
