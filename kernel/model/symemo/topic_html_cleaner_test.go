@@ -17,7 +17,10 @@
 package symemo
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -56,7 +59,7 @@ func TestTopicHTMLCleanerPolicyMatrix(t *testing.T) {
 		{
 			name:     "math and table nodes remain renderable",
 			input:    `<table><tr><td data-symemo-node-id="caller"><span data-type="inline-math" data-subtype="math" data-content="x^2"></span></td></tr></table><div data-type="NodeMathBlock" data-subtype="math" data-content="\int"></div>`,
-			wantHTML: `<table><tbody><tr><td data-symemo-node-id="ID"><span data-content="x^2" data-subtype="math" data-type="inline-math"></span></td></tr></tbody></table><div data-content="\int" data-subtype="math" data-symemo-node-id="ID" data-type="NodeMathBlock"></div>`,
+			wantHTML: `<table><tbody><tr><td data-symemo-node-id="ID"><span data-content="x^2" data-subtype="math" data-symemo-katex-trust="false" data-type="inline-math"></span></td></tr></tbody></table><div data-content="\int" data-subtype="math" data-symemo-katex-trust="false" data-symemo-node-id="ID" data-type="NodeMathBlock"></div>`,
 		},
 	}
 	for _, test := range tests {
@@ -81,6 +84,70 @@ func TestTopicHTMLCleanerRejectsNonRenderableFragments(t *testing.T) {
 		if cleaned, err := cleanTopicHTMLFragment(input); err == nil {
 			t.Fatalf("non-renderable input %q cleaned to %q", input, cleaned)
 		}
+	}
+}
+
+func TestTopicHTMLCleanerDropsTrustSensitiveMath(t *testing.T) {
+	inputs := []string{
+		`<p>kept</p><span data-type="inline-math" data-subtype="math" data-content="\href{javascript:alert(1)}{open}"></span>`,
+		`<p>kept</p><div data-type="NodeMathBlock" data-subtype="math" data-content="\includegraphics{https://127.0.0.1:1/' onerror='alert(document.domain)}"></div>`,
+		`<p>kept</p><span data-type="inline-math" data-subtype="math" data-content="\htmlStyle{background:url(javascript:alert(1))}{x}"></span>`,
+		"<p>kept</p><span data-type=\"inline-math\" data-subtype=\"math\" data-content=\"\\h% comment\nref{javascript:alert(1)}{open}\"></span>",
+		`<p>kept</p><span data-type="inline-math" data-subtype="math" data-content="\csname href\endcsname{javascript:alert(1)}{open}"></span>`,
+	}
+	for _, input := range inputs {
+		cleaned, err := cleanTopicHTMLFragment(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		normalized := feature004NodeIDPattern.ReplaceAllString(cleaned, `data-symemo-node-id="ID"`)
+		if normalized != `<p data-symemo-node-id="ID">kept</p>` {
+			t.Fatalf("trust-sensitive math survived cleaning: %s", cleaned)
+		}
+	}
+}
+
+func TestStoredV1TopicMathIsHardenedInProjectionWithoutAuthorityRewrite(t *testing.T) {
+	config := copyFixtureWorkspace(t)
+	elementID := "20260723232000-oldmath"
+	path := filepath.Join(config.ElementsRoot(), elementID+".sme")
+	writeTestJSON(t, path, Element{
+		Spec:            SupportedElementSpec,
+		ID:              elementID,
+		Type:            "topic",
+		Title:           "Stored math",
+		ProcessingState: "new",
+		PayloadSpec:     SupportedPayloadSpec,
+		Payload: ElementPayload{Material: &TopicMaterial{
+			Kind:                  "html",
+			HTML:                  `<span data-content="\href{javascript:alert(1)}{open}" data-subtype="math"></span><span data-content="x^2" data-subtype="math"></span><span data-content="y^2" data-subtype="math" data-type="inline-math"></span>`,
+			CleaningPolicyVersion: topicHTMLCleaningPolicyVersion,
+		}},
+	})
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+
+	result, err := engine.Query(context.Background(), Query{Kind: QueryElement, ElementID: elementID})
+	if err != nil || result.Element == nil || result.Element.Payload.Material == nil {
+		t.Fatalf("stored v1 Topic query = %#v, err=%v", result.Element, err)
+	}
+	want := `<span data-content="x^2" data-subtype="math" data-symemo-katex-trust="false"></span><span data-content="y^2" data-subtype="math" data-symemo-katex-trust="false" data-type="inline-math"></span>`
+	if result.Element.Payload.Material.HTML != want {
+		t.Fatalf("stored v1 Topic HTML = %s", result.Element.Payload.Material.HTML)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("projection hardening rewrote stored v1 authority")
 	}
 }
 

@@ -212,6 +212,7 @@ type feature004AuthoritySnapshot struct {
 	SortJSON              []byte            `json:"sortJson,omitempty"`
 	ElementSources        map[string][]byte `json:"elementSources"`
 	ReviewSources         map[string][]byte `json:"reviewSources"`
+	SchedulerSources      map[string][]byte `json:"schedulerSources"`
 	ProjectionSources     map[string][]byte `json:"projectionSources"`
 }
 
@@ -220,6 +221,7 @@ func snapshotFeature004Authority(t *testing.T, config Config) feature004Authorit
 	snapshot := feature004AuthoritySnapshot{
 		ElementSources:    snapshotDirectoryFiles(t, config.ElementsRoot()),
 		ReviewSources:     snapshotDirectoryFiles(t, config.ReviewsRoot()),
+		SchedulerSources:  snapshotDirectoryFiles(t, config.SchedulerRoot),
 		ProjectionSources: snapshotDirectoryFiles(t, config.IndexRoot),
 	}
 	snapshot.ElementsRootFileCount = len(snapshot.ElementSources)

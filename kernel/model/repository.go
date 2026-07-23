@@ -1587,6 +1587,14 @@ func IndexRepo(memo string) (id string, err error) {
 
 var syncingFiles = sync.Map{}
 var syncingStorages = atomic.Bool{}
+var activeSymemoRepositorySyncs = atomic.Int64{}
+
+type symemoRepositorySync struct {
+	drained     symemoSyncDrain
+	mergeResult *dejavu.MergeResult
+	resultKnown bool
+	finished    bool
+}
 
 func waitForSyncingStorages() {
 	for isSyncingStorages() {
@@ -1594,8 +1602,45 @@ func waitForSyncingStorages() {
 	}
 }
 
+func beginSymemoRepositorySync() (repositorySync *symemoRepositorySync) {
+	activeSymemoRepositorySyncs.Add(1)
+	defer func() {
+		if repositorySync == nil {
+			activeSymemoRepositorySyncs.Add(-1)
+		}
+	}()
+	repositorySync = &symemoRepositorySync{drained: workspaceSymemoRuntime.beginSyncDrain()}
+	return
+}
+
+func (repositorySync *symemoRepositorySync) recordMergeResult(mergeResult *dejavu.MergeResult) {
+	repositorySync.mergeResult = mergeResult
+	repositorySync.resultKnown = true
+}
+
+func (repositorySync *symemoRepositorySync) finish() {
+	if repositorySync == nil || repositorySync.finished {
+		return
+	}
+	repositorySync.finished = true
+	defer activeSymemoRepositorySyncs.Add(-1)
+	if !repositorySync.resultKnown {
+		rebuildSymemoAfterSyncDrain(repositorySync.drained)
+		return
+	}
+	finishSymemoRepositorySync(repositorySync.drained, repositorySync.mergeResult)
+}
+
+func finishSymemoRepositorySync(drained symemoSyncDrain, mergeResult *dejavu.MergeResult) {
+	if syncMergeChangesSymemoAuthority(mergeResult) {
+		rebuildSymemoAfterSyncMerge(mergeResult, drained)
+	} else {
+		workspaceSymemoRuntime.endSyncDrain(drained)
+	}
+}
+
 func isSyncingStorages() bool {
-	return syncingStorages.Load() || isBootSyncing.Load()
+	return syncingStorages.Load() || activeSymemoRepositorySyncs.Load() > 0 || isBootSyncing.Load()
 }
 
 func IsSyncingFile(rootID string) (ret bool) {
@@ -1643,9 +1688,13 @@ func syncRepoDownload() (err error) {
 	beforeSyncPetals := getPetals()
 
 	syncContext := map[string]any{eventbus.CtxPushMsg: eventbus.CtxPushMsgToStatusBar}
+	symemoSync := beginSymemoRepositorySync()
+	defer symemoSync.finish()
 	mergeResult, trafficStat, err := repo.SyncDownload(syncContext)
+	symemoSync.recordMergeResult(mergeResult)
 	elapsed := time.Since(start)
 	if err != nil {
+		symemoSync.finish()
 		planSyncAfter(fixSyncInterval)
 
 		logging.LogErrorf("sync data repo download failed: %s", err)
@@ -1673,7 +1722,7 @@ func syncRepoDownload() (err error) {
 	BootSyncSucc = 0
 
 	calcPetalDiff(beforeSyncPetals, mergeResult)
-	processSyncMergeResult(false, true, mergeResult, trafficStat, "d", elapsed)
+	processSyncMergeResult(false, true, mergeResult, trafficStat, "d", elapsed, symemoSync)
 	return
 }
 
@@ -1744,7 +1793,7 @@ func syncRepoUpload() (err error) {
 	autoSyncErrCount = 0
 	BootSyncSucc = 0
 
-	processSyncMergeResult(false, true, &dejavu.MergeResult{}, trafficStat, "u", elapsed)
+	processSyncMergeResult(false, true, &dejavu.MergeResult{}, trafficStat, "u", elapsed, nil)
 	return
 }
 
@@ -1936,9 +1985,13 @@ func syncRepo(exit, byHand bool) (dataChanged bool, err error) {
 	beforeSyncPetals := getPetals()
 
 	syncContext := map[string]any{eventbus.CtxPushMsg: eventbus.CtxPushMsgToStatusBar}
+	symemoSync := beginSymemoRepositorySync()
+	defer symemoSync.finish()
 	mergeResult, trafficStat, err := repo.Sync(syncContext)
+	symemoSync.recordMergeResult(mergeResult)
 	elapsed := time.Since(start)
 	if err != nil {
+		symemoSync.finish()
 		autoSyncErrCount++
 		planSyncAfter(fixSyncInterval)
 
@@ -1973,7 +2026,7 @@ func syncRepo(exit, byHand bool) (dataChanged bool, err error) {
 	autoSyncErrCount = 0
 
 	calcPetalDiff(beforeSyncPetals, mergeResult)
-	processSyncMergeResult(exit, byHand, mergeResult, trafficStat, "a", elapsed)
+	processSyncMergeResult(exit, byHand, mergeResult, trafficStat, "a", elapsed, symemoSync)
 
 	if !exit {
 		go func() {
@@ -2010,7 +2063,9 @@ func calcPetalDiff(beforeSyncPetals []*Petal, mergeResult *dejavu.MergeResult) {
 	mergeResult.RemovePetals = gulu.Str.RemoveDuplicatedElem(removePetals)
 }
 
-func processSyncMergeResult(exit, byHand bool, mergeResult *dejavu.MergeResult, trafficStat *dejavu.TrafficStat, mode string, elapsed time.Duration) {
+func processSyncMergeResult(exit, byHand bool, mergeResult *dejavu.MergeResult, trafficStat *dejavu.TrafficStat, mode string, elapsed time.Duration, symemoSync *symemoRepositorySync) {
+	defer symemoSync.finish()
+
 	logging.LogInfof("synced data repo [device=%s, kernel=%s, provider=%d, mode=%s/%t, ufc=%d, dfc=%d, ucc=%d, dcc=%d, ub=%s, db=%s] in [%.2fs], merge result [conflicts=%d, upserts=%d, removes=%d]\n\n",
 		Conf.System.ID, KernelID, Conf.Sync.Provider, mode, byHand,
 		trafficStat.UploadFileCount, trafficStat.DownloadFileCount, trafficStat.UploadChunkCount, trafficStat.DownloadChunkCount, humanize.BytesCustomCeil(uint64(trafficStat.UploadBytes), 2), humanize.BytesCustomCeil(uint64(trafficStat.DownloadBytes), 2),
@@ -2018,10 +2073,6 @@ func processSyncMergeResult(exit, byHand bool, mergeResult *dejavu.MergeResult, 
 		len(mergeResult.Conflicts), len(mergeResult.Upserts), len(mergeResult.Removes))
 
 	//logSyncMergeResult(mergeResult)
-	if syncMergeChangesSymemoAuthority(mergeResult) {
-		workspaceSymemoRuntime.beginSyncDrain()
-		syncingStorages.Store(true)
-	}
 
 	var needReloadFiletree bool
 	if 0 < len(mergeResult.Conflicts) {
@@ -2248,9 +2299,8 @@ func processSyncMergeResult(exit, byHand bool, mergeResult *dejavu.MergeResult, 
 		gulu.File.RemoveEmptyDirs(widgetDirPath)
 	}
 
-	rebuildSymemoAfterSyncMerge(mergeResult)
+	symemoSync.finish()
 	syncingFiles = sync.Map{}
-	syncingStorages.Store(false)
 
 	if needFullReindex(upsertTrees) { // 改进同步后全量重建索引判断 https://github.com/siyuan-note/siyuan/issues/5764
 		FullReindex(false)
@@ -2311,11 +2361,15 @@ func processSyncMergeResult(exit, byHand bool, mergeResult *dejavu.MergeResult, 
 	}()
 }
 
-func rebuildSymemoAfterSyncMerge(mergeResult *dejavu.MergeResult) {
+func rebuildSymemoAfterSyncMerge(mergeResult *dejavu.MergeResult, symemoDrained symemoSyncDrain) {
 	if !syncMergeChangesSymemoAuthority(mergeResult) {
 		return
 	}
-	if err := workspaceSymemoRuntime.rebuild(context.Background()); err != nil && !errors.Is(err, errSymemoRuntimeUninitialized) {
+	rebuildSymemoAfterSyncDrain(symemoDrained)
+}
+
+func rebuildSymemoAfterSyncDrain(symemoDrained symemoSyncDrain) {
+	if err := workspaceSymemoRuntime.rebuildAfterSyncDrain(context.Background(), symemoDrained); err != nil && !errors.Is(err, errSymemoRuntimeUninitialized) {
 		logging.LogErrorf("rebuild SiYuanMemo after data synchronization failed: %s", err)
 	}
 }

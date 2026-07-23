@@ -519,6 +519,16 @@ func (c Config) scanElementsWithWalker(walkDir func(string, fs.WalkDirFunc) erro
 			}
 			recordElement := element
 			recordElement.Children = nil
+			if material := recordElement.Payload.Material; material != nil && material.Kind == "html" && material.CleaningPolicyVersion == topicHTMLCleaningPolicyVersion {
+				hardenedMaterial := *material
+				hardenedHTML, hardenErr := hardenStoredTopicHTML(hardenedMaterial.HTML)
+				if hardenErr != nil {
+					result.Diagnostics = append(result.Diagnostics, ElementSourceDiagnostic{SourcePath: sourcePath, ElementID: recordElement.ID, Code: sourcePayloadCode, Reason: "Element HTML material is not renderable."})
+					return
+				}
+				hardenedMaterial.HTML = hardenedHTML
+				recordElement.Payload.Material = &hardenedMaterial
+			}
 			record := elementSourceRecord{
 				Element:        recordElement,
 				SourcePath:     sourcePath,
@@ -659,7 +669,7 @@ func (c Config) loadSortRanksForCreate() (map[string]int, error) {
 	return ranks, nil
 }
 
-func nextTopLevelSortRank(records map[string]elementSourceRecord) int {
+func nextTopLevelSortRank(records map[string]elementSourceRecord) (int, error) {
 	maxRank := -1
 	for _, record := range records {
 		if record.StorageKind != StorageKindRootDocument || record.ParentID != "" || record.SortRank == nil {
@@ -669,11 +679,17 @@ func nextTopLevelSortRank(records map[string]elementSourceRecord) int {
 			maxRank = *record.SortRank
 		}
 	}
-	return maxRank + 1
+	if maxRank == int(^uint(0)>>1) {
+		return 0, domainError(ErrHistoryRequiresRepair, "Element sort rank space is exhausted", nil)
+	}
+	return maxRank + 1, nil
 }
 
 func (c Config) writeRootElementSource(element Element, data []byte) error {
 	path := filepath.Join(c.ElementsRoot(), element.ID+".sme")
+	if err := invokeCreateHTMLTopicAuthorityFault("before-root"); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}

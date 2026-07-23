@@ -26,17 +26,18 @@ import (
 )
 
 type Engine struct {
-	config                    Config
-	creationMu                sync.Mutex
-	projectionMu              sync.Mutex
-	schedulerConfigHash       string
-	index                     *projectionIndex
-	ledger                    *SchedulingLedger
-	scheduler                 *Scheduler
-	session                   *learningSession
-	unavailable               atomic.Bool
-	beforeCreateHTMLTopicLock func()
-	beforeProjectionPublish   func()
+	config                        Config
+	schedulingWriteMu             sync.Mutex
+	projectionMu                  sync.Mutex
+	schedulerConfigHash           string
+	index                         *projectionIndex
+	ledger                        *SchedulingLedger
+	scheduler                     *Scheduler
+	session                       *learningSession
+	unavailable                   atomic.Bool
+	beforeCreateHTMLTopicLock     func()
+	onLearningActionLockContended func()
+	beforeProjectionPublish       func()
 }
 
 func NewEngine(ctx context.Context, config Config) (*Engine, error) {
@@ -85,8 +86,8 @@ func (engine *Engine) CreateElement(ctx context.Context, command CreateElementCo
 		if engine.beforeCreateHTMLTopicLock != nil {
 			engine.beforeCreateHTMLTopicLock()
 		}
-		engine.creationMu.Lock()
-		defer engine.creationMu.Unlock()
+		engine.schedulingWriteMu.Lock()
+		defer engine.schedulingWriteMu.Unlock()
 		if engine.unavailable.Load() {
 			return CreateElementResult{}, projectionRebuildFailedError()
 		}
@@ -112,6 +113,11 @@ func (engine *Engine) Query(ctx context.Context, query Query) (QueryResult, erro
 	case QueryElementSubset:
 		if query.Subset != "due" {
 			return QueryResult{}, domainError(ErrUnsupportedOperation, "only the due Element subset is available", nil)
+		}
+		engine.schedulingWriteMu.Lock()
+		defer engine.schedulingWriteMu.Unlock()
+		if engine.unavailable.Load() {
+			return QueryResult{}, projectionRebuildFailedError()
 		}
 		targets, err := engine.scheduler.BuildQueue(ctx)
 		if err != nil {
@@ -191,6 +197,16 @@ func (engine *Engine) Query(ctx context.Context, query Query) (QueryResult, erro
 }
 
 func (engine *Engine) RunLearningAction(ctx context.Context, action LearningAction) (LearningResult, error) {
+	if engine.unavailable.Load() {
+		return LearningResult{}, projectionRebuildFailedError()
+	}
+	if !engine.schedulingWriteMu.TryLock() {
+		if engine.onLearningActionLockContended != nil {
+			engine.onLearningActionLockContended()
+		}
+		engine.schedulingWriteMu.Lock()
+	}
+	defer engine.schedulingWriteMu.Unlock()
 	if engine.unavailable.Load() {
 		return LearningResult{}, projectionRebuildFailedError()
 	}

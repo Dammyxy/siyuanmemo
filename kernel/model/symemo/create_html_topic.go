@@ -30,6 +30,7 @@ import (
 var newCreateHTMLTopicElementID = ast.NewNodeID
 var newCreateHTMLTopicEventID = ast.NewNodeID
 var marshalCreateHTMLTopicAuthorityJSON = json.MarshalIndent
+var statCreateHTMLTopicRoot = os.Stat
 
 var createHTMLTopicAuthorityFault func(stage string) error
 
@@ -70,7 +71,7 @@ func (engine *Engine) createHTMLTopic(ctx context.Context, command AddNewTopicCo
 	sortWritten := false
 	alreadyAccepted, err := engine.ledger.commitPrepared(plan.event, marshalCreateHTMLTopicAuthorityJSON, func() error {
 		if writeErr := engine.config.writeRootElementSource(plan.element, plan.rootBytes); writeErr != nil {
-			if _, statErr := os.Stat(filepath.Join(engine.config.ElementsRoot(), plan.elementID+".sme")); statErr == nil {
+			if _, statErr := statCreateHTMLTopicRoot(filepath.Join(engine.config.ElementsRoot(), plan.elementID+".sme")); !errors.Is(statErr, os.ErrNotExist) {
 				rootWritten = true
 			}
 			return writeErr
@@ -87,8 +88,11 @@ func (engine *Engine) createHTMLTopic(ctx context.Context, command AddNewTopicCo
 		if errors.As(err, &serializationErr) {
 			return result, createHTMLTopicError(ErrInvalidCreateCommand, "created Topic authority is not serializable", plan.elementID, plan.eventID, false, false, err)
 		}
-		engine.unavailable.Store(true)
-		return result, classifyCreateHTMLTopicWriteError(err, plan.elementID, plan.eventID, rootWritten, sortWritten)
+		writeErr := classifyCreateHTMLTopicWriteError(err, plan.elementID, plan.eventID, rootWritten, sortWritten)
+		if rootWritten || sortWritten {
+			engine.unavailable.Store(true)
+		}
+		return result, writeErr
 	}
 	if alreadyAccepted {
 		return result, createHTMLTopicError(ErrInvalidCreateCommand, "generated Topic event identity collides with existing authority", plan.elementID, plan.eventID, false, false, nil)
@@ -124,11 +128,14 @@ func (engine *Engine) planCreateHTMLTopic(title, cleanedHTML string) (createHTML
 	if err != nil {
 		return createHTMLTopicPlan{}, err
 	}
+	sortRank, err := nextTopLevelSortRank(scan.Records)
+	if err != nil {
+		return createHTMLTopicPlan{}, err
+	}
 	elementID, eventID, err := engine.generateCreateHTMLTopicIdentities(scan, events)
 	if err != nil {
 		return createHTMLTopicPlan{}, err
 	}
-	sortRank := nextTopLevelSortRank(scan.Records)
 	sortRanks[elementID] = sortRank
 	element := Element{
 		Spec:            SupportedElementSpec,

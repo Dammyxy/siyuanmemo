@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/88250/lute/ast"
 	xhtml "golang.org/x/net/html"
@@ -87,6 +88,9 @@ func cleanTopicHTMLNode(node *xhtml.Node) []*xhtml.Node {
 			return children
 		}
 		cleaned := &xhtml.Node{Type: xhtml.ElementNode, Data: name, Attr: sanitizeTopicHTMLAttrs(name, node.Attr)}
+		if topicHTMLMathElement(name, node) && topicHTMLAttrValue(cleaned, "data-content") == "" {
+			return nil
+		}
 		for _, child := range children {
 			appendHTMLChild(cleaned, child)
 		}
@@ -129,11 +133,8 @@ func topicHTMLKeepsElement(name string, node *xhtml.Node) bool {
 	if name == "html" || name == "body" {
 		return false
 	}
-	if name == "span" {
-		return hasTopicHTMLAttr(node, "data-type", "inline-math") && hasTopicHTMLAttr(node, "data-subtype", "math")
-	}
-	if name == "div" {
-		return hasTopicHTMLAttr(node, "data-type", "NodeMathBlock") && hasTopicHTMLAttr(node, "data-subtype", "math")
+	if name == "span" || name == "div" {
+		return topicHTMLMathElement(name, node)
 	}
 	switch name {
 	case "h1", "h2", "h3", "h4", "h5", "h6", "p", "br", "ul", "ol", "li", "blockquote", "pre", "code", "table", "thead", "tbody", "tfoot", "tr", "th", "td", "figure", "figcaption", "hr", "strong", "b", "em", "i", "u", "s", "del", "ins", "mark", "sub", "sup", "a", "img":
@@ -209,10 +210,13 @@ func sanitizeTopicHTMLAttrs(name string, attrs []xhtml.Attribute) []xhtml.Attrib
 				values[key] = attr.Val
 			}
 		case "data-content":
-			if (name == "span" || name == "div") && attr.Val != "" {
+			if (name == "span" || name == "div") && attr.Val != "" && topicHTMLMathContentSafe(attr.Val) {
 				values[key] = attr.Val
 			}
 		}
+	}
+	if values["data-content"] != "" && values["data-subtype"] == "math" {
+		values["data-symemo-katex-trust"] = "false"
 	}
 	keys := make([]string, 0, len(values))
 	for key := range values {
@@ -224,6 +228,168 @@ func sanitizeTopicHTMLAttrs(name string, attrs []xhtml.Attribute) []xhtml.Attrib
 		out = append(out, xhtml.Attribute{Key: key, Val: values[key]})
 	}
 	return out
+}
+
+func topicHTMLMathElement(name string, node *xhtml.Node) bool {
+	if name == "span" {
+		return hasTopicHTMLAttr(node, "data-type", "inline-math") && hasTopicHTMLAttr(node, "data-subtype", "math")
+	}
+	return name == "div" && hasTopicHTMLAttr(node, "data-type", "NodeMathBlock") && hasTopicHTMLAttr(node, "data-subtype", "math")
+}
+
+func topicHTMLRenderedMathElement(node *xhtml.Node) bool {
+	return node.Type == xhtml.ElementNode && hasTopicHTMLAttr(node, "data-subtype", "math")
+}
+
+func topicHTMLMathContentSafe(content string) bool {
+	withoutComments := stripTopicHTMLMathComments(content)
+	for i := 0; i < len(withoutComments); {
+		if withoutComments[i] != '\\' {
+			i++
+			continue
+		}
+		i++
+		start := i
+		for i < len(withoutComments) && isTopicHTMLMathCommandByte(withoutComments[i]) {
+			i++
+		}
+		if start == i {
+			if i < len(withoutComments) {
+				i++
+			}
+			continue
+		}
+		command := withoutComments[start:i]
+		if strings.HasPrefix(command, "html") || unsafeTopicHTMLMathCommands[command] {
+			return false
+		}
+	}
+	compact := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return -1
+		}
+		return unicode.ToLower(r)
+	}, withoutComments)
+	for _, scheme := range []string{"javascript:", "vbscript:", "data:", "file:"} {
+		if strings.Contains(compact, scheme) {
+			return false
+		}
+	}
+	return true
+}
+
+func hardenStoredTopicHTML(input string) (string, error) {
+	context := &xhtml.Node{Type: xhtml.ElementNode, DataAtom: atom.Body, Data: "body"}
+	nodes, err := xhtml.ParseFragment(strings.NewReader(input), context)
+	if err != nil {
+		return "", err
+	}
+	changed := false
+	var harden func(*xhtml.Node) bool
+	harden = func(node *xhtml.Node) bool {
+		for child := node.FirstChild; child != nil; {
+			next := child.NextSibling
+			if !harden(child) {
+				node.RemoveChild(child)
+				changed = true
+			}
+			child = next
+		}
+		if !topicHTMLRenderedMathElement(node) {
+			return true
+		}
+		content := topicHTMLAttrValue(node, "data-content")
+		if content == "" || !topicHTMLMathContentSafe(content) {
+			return false
+		}
+		markerCount := 0
+		markerIsFalse := false
+		attrs := node.Attr[:0]
+		for _, attr := range node.Attr {
+			if attr.Key == "data-symemo-katex-trust" {
+				markerCount++
+				markerIsFalse = attr.Val == "false"
+				continue
+			}
+			attrs = append(attrs, attr)
+		}
+		if markerCount != 1 || !markerIsFalse {
+			changed = true
+		}
+		node.Attr = append(attrs, xhtml.Attribute{Key: "data-symemo-katex-trust", Val: "false"})
+		sort.Slice(node.Attr, func(i, j int) bool { return node.Attr[i].Key < node.Attr[j].Key })
+		return true
+	}
+	kept := nodes[:0]
+	for _, node := range nodes {
+		if harden(node) {
+			kept = append(kept, node)
+		} else {
+			changed = true
+		}
+	}
+	if !changed {
+		return input, nil
+	}
+	var builder strings.Builder
+	for _, node := range kept {
+		renderTopicHTMLNode(&builder, node)
+	}
+	return builder.String(), nil
+}
+
+var unsafeTopicHTMLMathCommands = map[string]bool{
+	"catcode":         true,
+	"csname":          true,
+	"def":             true,
+	"edef":            true,
+	"endcsname":       true,
+	"expandafter":     true,
+	"futurelet":       true,
+	"gdef":            true,
+	"global":          true,
+	"href":            true,
+	"includegraphics": true,
+	"let":             true,
+	"long":            true,
+	"newcommand":      true,
+	"noexpand":        true,
+	"providecommand":  true,
+	"renewcommand":    true,
+	"url":             true,
+	"xdef":            true,
+}
+
+func stripTopicHTMLMathComments(content string) string {
+	var builder strings.Builder
+	for i := 0; i < len(content); i++ {
+		if content[i] != '%' || topicHTMLMathPercentEscaped(content, i) {
+			builder.WriteByte(content[i])
+			continue
+		}
+		for i+1 < len(content) && content[i+1] != '\n' && content[i+1] != '\r' {
+			i++
+		}
+		if i+1 < len(content) && content[i+1] == '\r' {
+			i++
+		}
+		if i+1 < len(content) && content[i+1] == '\n' {
+			i++
+		}
+	}
+	return builder.String()
+}
+
+func topicHTMLMathPercentEscaped(content string, percent int) bool {
+	backslashes := 0
+	for i := percent - 1; i >= 0 && content[i] == '\\'; i-- {
+		backslashes++
+	}
+	return backslashes%2 == 1
+}
+
+func isTopicHTMLMathCommandByte(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value == '@'
 }
 
 func sanitizeTopicHTMLURL(raw string) string {

@@ -138,3 +138,67 @@ func TestProjectionRefreshCannotPublishOlderSnapshotAfterCreate(t *testing.T) {
 		t.Fatalf("published created Topic = %#v, err=%v", query.Element, err)
 	}
 }
+
+func TestCreateHTMLTopicAndLearningWritesShareCollectionLease(t *testing.T) {
+	engine, config := newFixtureEngine(t)
+	if _, err := engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionStart}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionShowAnswer, ElementID: fixtureElementID}); err != nil {
+		t.Fatal(err)
+	}
+	restoreIDs := withCreateHTMLTopicNodeIDs(t, "20260723230000-lockaaa", "20260723230001-lockevt")
+	defer restoreIDs()
+
+	createPublishing := make(chan struct{})
+	releaseCreate := make(chan struct{})
+	var createReleased atomic.Bool
+	releaseCreateOnce := func() {
+		if createReleased.CompareAndSwap(false, true) {
+			close(releaseCreate)
+		}
+	}
+	defer releaseCreateOnce()
+	var blocked atomic.Bool
+	engine.beforeProjectionPublish = func() {
+		if blocked.CompareAndSwap(false, true) {
+			close(createPublishing)
+			<-releaseCreate
+		}
+	}
+
+	createDone := make(chan error, 1)
+	go func() {
+		_, err := engine.CreateElement(t.Context(), CreateElementCommand{
+			Kind:        CreateElementAddNewTopic,
+			AddNewTopic: AddNewTopicCommand{Title: "Serialized", HTML: "<p>Body</p>"},
+		})
+		createDone <- err
+	}()
+	<-createPublishing
+
+	grade := 4
+	gradeEventID := "20260723230002-gradeaa"
+	gradeWaiting := make(chan struct{})
+	engine.onLearningActionLockContended = func() { close(gradeWaiting) }
+	gradeDone := make(chan error, 1)
+	go func() {
+		_, err := engine.RunLearningAction(t.Context(), LearningAction{Kind: ActionGradeItem, ElementID: fixtureElementID, RawGrade: &grade, EventID: gradeEventID})
+		gradeDone <- err
+	}()
+	select {
+	case <-gradeWaiting:
+	case <-time.After(time.Second):
+		t.Fatal("learning action did not contend on the collection scheduling-write mutex")
+	}
+	if count := countEventsByID(t, config, gradeEventID); count != 0 {
+		t.Fatalf("learning write committed %d events before create publication", count)
+	}
+	releaseCreateOnce()
+	if err := <-createDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-gradeDone; err != nil {
+		t.Fatal(err)
+	}
+}

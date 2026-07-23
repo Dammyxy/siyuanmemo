@@ -89,6 +89,46 @@ func TestCreateTopicStorageRejectsGeneratedIdentityCollisionsBeforeWriting(t *te
 	}
 }
 
+func TestCreateTopicStorageRejectsExhaustedTopLevelSortRankBeforeWriting(t *testing.T) {
+	engine, config := newFixtureEngine(t)
+	ranks, err := config.loadSortRanksForCreate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ranks[fixtureElementID] = int(^uint(0) >> 1)
+	writeTestJSON(t, filepath.Join(config.ElementsRoot(), ".siyuan", "sort.json"), ranks)
+	previousElementID, previousEventID := newCreateHTMLTopicElementID, newCreateHTMLTopicEventID
+	generatedIdentities := 0
+	newCreateHTMLTopicElementID = func() string {
+		generatedIdentities++
+		return "20260723223000-overflw"
+	}
+	newCreateHTMLTopicEventID = func() string {
+		generatedIdentities++
+		return "20260723223001-overevt"
+	}
+	t.Cleanup(func() {
+		newCreateHTMLTopicElementID = previousElementID
+		newCreateHTMLTopicEventID = previousEventID
+	})
+	before := marshalFeature004AuthoritySnapshot(t, snapshotFeature004Authority(t, config))
+
+	_, err = engine.CreateElement(context.Background(), CreateElementCommand{
+		Kind:        CreateElementAddNewTopic,
+		AddNewTopic: AddNewTopicCommand{Title: "Overflow", HTML: "<p>Body</p>"},
+	})
+	if !hasCode(err, ErrHistoryRequiresRepair) {
+		t.Fatalf("exhausted sort rank error = %v", err)
+	}
+	if generatedIdentities != 0 {
+		t.Fatalf("exhausted sort rank generated %d identities before rejection", generatedIdentities)
+	}
+	after := marshalFeature004AuthoritySnapshot(t, snapshotFeature004Authority(t, config))
+	if string(after) != string(before) {
+		t.Fatalf("exhausted sort rank changed authority\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
 func TestCreateTopicStorageReadOnlyAndSchedulerPreflightLeaveAllFilesUnchanged(t *testing.T) {
 	for _, test := range []struct {
 		name     string

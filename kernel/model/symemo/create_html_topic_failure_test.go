@@ -86,6 +86,53 @@ func TestCreateHTMLTopicInvalidCommandLeavesAuthorityUnchanged(t *testing.T) {
 	}
 }
 
+func TestCreateHTMLTopicZeroWriteFailureDoesNotLatchEngine(t *testing.T) {
+	engine, config := newFixtureEngine(t)
+	restoreIDs := withCreateHTMLTopicNodeIDs(t, "20260723224000-zeroerr", "20260723224001-zeroevt")
+	defer restoreIDs()
+	restoreFault := withCreateHTMLTopicAuthorityFault(t, "before-root", errors.New("injected pre-write failure"))
+	defer restoreFault()
+
+	result, err := engine.CreateElement(context.Background(), CreateElementCommand{
+		Kind:        CreateElementAddNewTopic,
+		AddNewTopic: AddNewTopicCommand{Title: "No write", HTML: "<p>Body</p>"},
+	})
+	if !hasCode(err, ErrDurableWriteFailed) || result.CreateAccepted || result.ReviewAccepted {
+		t.Fatalf("zero-write failure = %#v, result=%#v", err, result)
+	}
+	if _, err = engine.Query(context.Background(), Query{Kind: QueryCurrentSession}); err != nil {
+		t.Fatalf("zero-write failure latched Engine: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(config.ElementsRoot(), result.ElementID+".sme")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("zero-write failure left root source: %v", statErr)
+	}
+}
+
+func TestCreateHTMLTopicIndeterminateRootWriteFailsClosed(t *testing.T) {
+	engine, config := newFixtureEngine(t)
+	restoreIDs := withCreateHTMLTopicNodeIDs(t, "20260723233000-staterr", "20260723233001-statevt")
+	defer restoreIDs()
+	restoreFault := withCreateHTMLTopicAuthorityFault(t, "root", errors.New("injected post-write failure"))
+	defer restoreFault()
+	previousStat := statCreateHTMLTopicRoot
+	statCreateHTMLTopicRoot = func(string) (os.FileInfo, error) { return nil, os.ErrPermission }
+	t.Cleanup(func() { statCreateHTMLTopicRoot = previousStat })
+
+	result, err := engine.CreateElement(context.Background(), CreateElementCommand{
+		Kind:        CreateElementAddNewTopic,
+		AddNewTopic: AddNewTopicCommand{Title: "Unknown write", HTML: "<p>Body</p>"},
+	})
+	if !hasCode(err, ErrElementWritePartial) || result.CreateAccepted || result.ReviewAccepted {
+		t.Fatalf("indeterminate root write = %#v, result=%#v", err, result)
+	}
+	if _, statErr := os.Stat(filepath.Join(config.ElementsRoot(), result.ElementID+".sme")); statErr != nil {
+		t.Fatalf("injected root write did not reach authority: %v", statErr)
+	}
+	if _, queryErr := engine.Query(context.Background(), Query{Kind: QueryCurrentSession}); !hasCode(queryErr, ErrProjectionRebuildFailed) {
+		t.Fatalf("indeterminate root write left Engine available: %v", queryErr)
+	}
+}
+
 func TestCreateHTMLTopicSerializationFailureBeforeEventEnvelopeLeavesAuthorityUnchanged(t *testing.T) {
 	engine, config := newFixtureEngine(t)
 	before := snapshotFeature004Authority(t, config)

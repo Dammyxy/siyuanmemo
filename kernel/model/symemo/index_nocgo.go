@@ -94,17 +94,21 @@ func (index *projectionIndex) replaceAll(_ context.Context, build projectionBuil
 	if err != nil {
 		return err
 	}
+	var published fileProjection
+	if err = json.Unmarshal(data, &published); err != nil {
+		return err
+	}
 	if err = index.saveDataLocked(data); err != nil {
 		return err
 	}
-	index.data = next
+	index.data = published
 	return nil
 }
 
 func (index *projectionIndex) tree() ([]ElementTreeNode, error) {
 	index.mu.RLock()
 	defer index.mu.RUnlock()
-	return append([]ElementTreeNode(nil), index.data.Tree...), nil
+	return cloneNonCGOProjectionValue(index.data.Tree)
 }
 
 func (index *projectionIndex) saveDataLocked(data []byte) error {
@@ -125,7 +129,7 @@ func (index *projectionIndex) saveLocked() error {
 func (index *projectionIndex) sourceDiagnostics() ([]ElementSourceDiagnostic, error) {
 	index.mu.RLock()
 	defer index.mu.RUnlock()
-	return append([]ElementSourceDiagnostic(nil), index.data.SourceDiagnostics...), nil
+	return cloneNonCGOProjectionValue(index.data.SourceDiagnostics)
 }
 
 func (index *projectionIndex) projection(elementID string) (SchedulingProjection, error) {
@@ -155,42 +159,45 @@ func (index *projectionIndex) element(elementID string) (Element, error) {
 	if !ok {
 		return Element{}, errProjectionNotFound
 	}
-	return element, nil
+	return cloneNonCGOProjectionValue(element)
 }
 
 func (index *projectionIndex) snapshot() (projectionSnapshot, error) {
 	index.mu.RLock()
 	defer index.mu.RUnlock()
+	cloned, err := cloneNonCGOProjectionValue(index.data)
+	if err != nil {
+		return projectionSnapshot{}, err
+	}
 	snapshot := projectionSnapshot{
-		Elements:                 make(map[string]Element, len(index.data.Elements)),
-		Tree:                     append([]ElementTreeNode(nil), index.data.Tree...),
-		Projections:              make(map[string]SchedulingProjection, len(index.data.Projections)),
-		FinalDrillProjections:    make(map[string]FinalDrillProjection, len(index.data.FinalDrillProjections)),
-		HistoryEventFingerprints: make(map[string]bool, len(index.data.HistoryEventFingerprints)),
+		Elements:                 cloned.Elements,
+		Tree:                     cloned.Tree,
+		Projections:              cloned.Projections,
+		FinalDrillProjections:    cloned.FinalDrillProjections,
+		HistoryEventFingerprints: make(map[string]bool, len(cloned.HistoryEventFingerprints)),
 		BlockedElementIDs:        make(map[string]bool),
 	}
-	for id, element := range index.data.Elements {
-		snapshot.Elements[id] = element
-	}
-	for id, projection := range index.data.Projections {
-		cloned, err := cloneSchedulingProjection(projection)
-		if err != nil {
-			return projectionSnapshot{}, err
-		}
-		snapshot.Projections[id] = cloned
-	}
-	for id, projection := range index.data.FinalDrillProjections {
-		snapshot.FinalDrillProjections[id] = projection
-	}
-	for _, fingerprint := range index.data.HistoryEventFingerprints {
+	for _, fingerprint := range cloned.HistoryEventFingerprints {
 		snapshot.HistoryEventFingerprints[fingerprint] = true
 	}
-	for _, diagnostic := range index.data.SourceDiagnostics {
+	for _, diagnostic := range cloned.SourceDiagnostics {
 		if diagnostic.Code == schedulingHistoryUnavailableCode && diagnostic.ElementID != "" {
 			snapshot.BlockedElementIDs[diagnostic.ElementID] = true
 		}
 	}
 	return snapshot, nil
+}
+
+func cloneNonCGOProjectionValue[T any](value T) (T, error) {
+	var cloned T
+	data, err := json.Marshal(value)
+	if err != nil {
+		return cloned, err
+	}
+	if err = json.Unmarshal(data, &cloned); err != nil {
+		return cloned, err
+	}
+	return cloned, nil
 }
 
 func (index *projectionIndex) close() error { return nil }

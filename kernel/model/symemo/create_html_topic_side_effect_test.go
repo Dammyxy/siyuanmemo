@@ -27,11 +27,13 @@ import (
 
 func TestCreateHTMLTopicHasNoHostDocumentAssetHistoryOrSessionSideEffects(t *testing.T) {
 	for _, test := range []struct {
-		name  string
-		setup func(*testing.T)
+		name         string
+		setup        func(*testing.T)
+		wantError    ErrorCode
+		wantAccepted bool
 	}{
-		{name: "success"},
-		{name: "partial", setup: func(t *testing.T) {
+		{name: "success", wantAccepted: true},
+		{name: "partial", wantError: ErrElementWritePartial, setup: func(t *testing.T) {
 			withCreateHTMLTopicAuthorityFault(t, "root", errors.New("side-effect audit fault"))
 		}},
 	} {
@@ -42,7 +44,14 @@ func TestCreateHTMLTopicHasNoHostDocumentAssetHistoryOrSessionSideEffects(t *tes
 			}
 			restoreIDs := withCreateHTMLTopicNodeIDs(t, "20260723130000-sidefxs", "20260723130001-sideevt")
 			defer restoreIDs()
-			_, _ = engine.CreateElement(context.Background(), CreateElementCommand{Kind: CreateElementAddNewTopic, AddNewTopic: AddNewTopicCommand{Title: "Side Effects", HTML: `<p><img src="https://example.com/image.png" alt="remote"></p>`}})
+			result, err := engine.CreateElement(context.Background(), CreateElementCommand{Kind: CreateElementAddNewTopic, AddNewTopic: AddNewTopicCommand{Title: "Side Effects", HTML: `<p><img src="https://example.com/image.png" alt="remote"></p>`}})
+			if test.wantError == "" {
+				if err != nil || result.CreateAccepted != test.wantAccepted || result.ReviewAccepted != test.wantAccepted || result.Topic == nil {
+					t.Fatalf("successful side-effect audit result=%#v, err=%v", result, err)
+				}
+			} else if !hasCode(err, test.wantError) || result.CreateAccepted || result.ReviewAccepted || result.Topic != nil {
+				t.Fatalf("failed side-effect audit result=%#v, err=%v", result, err)
+			}
 			assertNoCreateHTMLTopicHostSideEffects(t, config.StorageRoot)
 		})
 	}

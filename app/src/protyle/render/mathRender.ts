@@ -33,7 +33,8 @@ export const mathRender = (element: Element, cdn = Constants.PROTYLE_CDN, maxWid
                         displayMode: isBlock,
                         output: "html",
                         macros,
-                        trust: true, // REF: https://katex.org/docs/supported#html
+                        // 参考：https://katex.org/docs/supported#html
+                        trust: mathElement.getAttribute("data-symemo-katex-trust") !== "false",
                         strict: (errorCode) => errorCode === "unicodeTextInMathMode" ? "ignore" : "warn",
                     });
                     const blockElement = hasClosestBlock(mathElement);

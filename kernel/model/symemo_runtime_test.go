@@ -155,17 +155,252 @@ func TestSymemoRuntimeSyncDrainRejectsNewLeaseBeforeReplacement(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = hostRuntime.Close() })
 
-	hostRuntime.beginSyncDrain()
+	drain := hostRuntime.beginSyncDrain()
+	if !drain.acquired {
+		t.Fatal("available Runtime did not begin sync drain")
+	}
 	if _, err := hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryCurrentSession}); err == nil {
 		t.Fatal("sync drain admitted a new Runtime lease")
 	} else {
 		assertSymemoRuntimeCode(t, err, symemo.ErrProjectionRebuildFailed)
 	}
-	if err := hostRuntime.rebuild(t.Context()); err != nil {
+	if err := hostRuntime.rebuildAfterSyncDrain(t.Context(), drain); err != nil {
 		t.Fatal(err)
 	}
 	if opens != 2 {
 		t.Fatalf("Engine opens = %d, want replacement", opens)
+	}
+}
+
+func TestSymemoRuntimeSyncDrainWaitsForActiveLeaseAndCanResume(t *testing.T) {
+	root := t.TempDir()
+	config := symemo.Config{StorageRoot: filepath.Join(root, "storage"), IndexRoot: filepath.Join(root, "temp", "siyuanmemo")}
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hostRuntime.Close() })
+
+	operationStarted := make(chan struct{})
+	releaseOperation := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseOperation) }) }
+	t.Cleanup(release)
+	operationDone := make(chan error, 1)
+	go func() {
+		operationDone <- hostRuntime.withEngine(func(*symemo.Engine) error {
+			close(operationStarted)
+			<-releaseOperation
+			return nil
+		})
+	}()
+	<-operationStarted
+	drainDone := make(chan symemoSyncDrain, 1)
+	go func() { drainDone <- hostRuntime.beginSyncDrain() }()
+	select {
+	case <-drainDone:
+		t.Fatal("sync drain completed before active lease")
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	if err := <-operationDone; err != nil {
+		t.Fatal(err)
+	}
+	drain := <-drainDone
+	if !drain.acquired || !drain.resume {
+		t.Fatal("available Runtime did not acquire sync drain")
+	}
+	hostRuntime.endSyncDrain(drain)
+	if _, err := hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryCurrentSession}); err != nil {
+		t.Fatalf("unchanged sync did not resume Runtime: %v", err)
+	}
+}
+
+func TestSymemoRuntimeSyncDrainDoesNotResumeFailureFromDrainedLease(t *testing.T) {
+	root := t.TempDir()
+	config := symemo.Config{StorageRoot: filepath.Join(root, "storage"), IndexRoot: filepath.Join(root, "temp", "siyuanmemo")}
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hostRuntime.Close() })
+
+	operationStarted := make(chan struct{})
+	releaseOperation := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseOperation) }) }
+	t.Cleanup(release)
+	failure := &symemo.DomainError{Code: symemo.ErrProjectionRefreshFailed, Message: "injected projection failure"}
+	operationDone := make(chan error, 1)
+	go func() {
+		operationDone <- hostRuntime.withEngine(func(*symemo.Engine) error {
+			close(operationStarted)
+			<-releaseOperation
+			return failure
+		})
+	}()
+	<-operationStarted
+
+	drainDone := make(chan symemoSyncDrain, 1)
+	go func() { drainDone <- hostRuntime.beginSyncDrain() }()
+	drainDeadline := time.NewTimer(time.Second)
+	defer drainDeadline.Stop()
+	for {
+		hostRuntime.mu.Lock()
+		draining := hostRuntime.draining
+		hostRuntime.mu.Unlock()
+		if draining {
+			break
+		}
+		select {
+		case <-drainDeadline.C:
+			t.Fatal("Runtime did not begin sync draining")
+		default:
+			runtime.Gosched()
+		}
+	}
+	release()
+	if err := <-operationDone; !errors.Is(err, failure) {
+		t.Fatalf("drained lease error = %v", err)
+	}
+	drain := <-drainDone
+	if !drain.acquired || !drain.resume {
+		t.Fatalf("available Runtime drain = %#v", drain)
+	}
+	hostRuntime.endSyncDrain(drain)
+
+	if _, err := hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryCurrentSession}); err == nil {
+		t.Fatal("unchanged sync resumed a Runtime failed by an in-flight lease")
+	} else {
+		assertSymemoRuntimeCode(t, err, symemo.ErrProjectionRebuildFailed)
+	}
+	hostRuntime.mu.Lock()
+	state, storedFailure := hostRuntime.state, hostRuntime.failure
+	hostRuntime.mu.Unlock()
+	if state != symemoRuntimeUnavailable || !errors.Is(storedFailure, failure) {
+		t.Fatalf("Runtime state=%d failure=%v", state, storedFailure)
+	}
+}
+
+func TestSymemoRuntimeSyncDrainWaitsForActiveLeaseWhileUnavailable(t *testing.T) {
+	root := t.TempDir()
+	config := symemo.Config{StorageRoot: filepath.Join(root, "storage"), IndexRoot: filepath.Join(root, "temp", "siyuanmemo")}
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hostRuntime.Close() })
+
+	operationStarted := make(chan struct{})
+	releaseOperation := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseOperation) }) }
+	t.Cleanup(release)
+	operationDone := make(chan error, 1)
+	go func() {
+		operationDone <- hostRuntime.withEngine(func(*symemo.Engine) error {
+			close(operationStarted)
+			<-releaseOperation
+			return nil
+		})
+	}()
+	<-operationStarted
+	failure := &symemo.DomainError{Code: symemo.ErrProjectionRefreshFailed, Message: "injected projection failure"}
+	if err := hostRuntime.withEngine(func(*symemo.Engine) error { return failure }); !errors.Is(err, failure) {
+		t.Fatalf("failing lease error = %v", err)
+	}
+
+	drainDone := make(chan symemoSyncDrain, 1)
+	go func() { drainDone <- hostRuntime.beginSyncDrain() }()
+	select {
+	case <-drainDone:
+		t.Fatal("unavailable Runtime drain completed before active lease")
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	if err := <-operationDone; err != nil {
+		t.Fatal(err)
+	}
+	drain := <-drainDone
+	if !drain.acquired || drain.resume {
+		t.Fatal("unavailable Runtime did not acquire sync drain")
+	}
+	hostRuntime.endSyncDrain(drain)
+	if _, err := hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryCurrentSession}); err == nil {
+		t.Fatal("sync drain resumed a previously unavailable Runtime")
+	} else {
+		assertSymemoRuntimeCode(t, err, symemo.ErrProjectionRebuildFailed)
+	}
+}
+
+func TestSymemoRuntimeSyncDrainReleasesUnavailableRuntimeWithoutEngine(t *testing.T) {
+	hostRuntime := newSymemoRuntime(func(context.Context) (*symemo.Engine, error) {
+		return nil, errors.New("injected initialization failure")
+	})
+	if err := hostRuntime.initialize(t.Context()); err == nil {
+		t.Fatal("Runtime initialization unexpectedly succeeded")
+	}
+	drain := hostRuntime.beginSyncDrain()
+	if !drain.acquired || drain.resume {
+		t.Fatalf("failed Runtime drain = %#v", drain)
+	}
+	hostRuntime.endSyncDrain(drain)
+	hostRuntime.mu.Lock()
+	draining, state := hostRuntime.draining, hostRuntime.state
+	hostRuntime.mu.Unlock()
+	if draining || state != symemoRuntimeUnavailable {
+		t.Fatalf("failed Runtime after sync drain: draining=%v state=%d", draining, state)
+	}
+}
+
+func TestSymemoRuntimeOrdinaryRebuildWaitsForSyncOwnedDrain(t *testing.T) {
+	root := t.TempDir()
+	config := symemo.Config{StorageRoot: filepath.Join(root, "storage"), IndexRoot: filepath.Join(root, "temp", "siyuanmemo")}
+	opens := 0
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		opens++
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hostRuntime.Close() })
+
+	drain := hostRuntime.beginSyncDrain()
+	if !drain.acquired {
+		t.Fatal("available Runtime did not acquire sync drain")
+	}
+	rebuildStarted := make(chan struct{})
+	rebuildDone := make(chan error, 1)
+	go func() {
+		close(rebuildStarted)
+		rebuildDone <- hostRuntime.rebuild(t.Context())
+	}()
+	<-rebuildStarted
+	select {
+	case err := <-rebuildDone:
+		t.Fatalf("ordinary rebuild crossed sync-owned drain: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	hostRuntime.mu.Lock()
+	rebuilding := hostRuntime.rebuilding
+	hostRuntime.mu.Unlock()
+	if rebuilding || opens != 1 {
+		t.Fatalf("ordinary rebuild entered replacement during sync drain: rebuilding=%v opens=%d", rebuilding, opens)
+	}
+
+	hostRuntime.endSyncDrain(drain)
+	if err := <-rebuildDone; err != nil {
+		t.Fatal(err)
+	}
+	if opens != 2 {
+		t.Fatalf("ordinary rebuild opened %d Engines after sync drain", opens)
 	}
 }
 
@@ -256,6 +491,71 @@ func TestSymemoRuntimeCloseDrainsActiveOperationAndRejectsNewWork(t *testing.T) 
 	_, err = hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryCurrentSession})
 	if !errors.Is(err, errSymemoRuntimeUninitialized) {
 		t.Fatalf("closed Runtime query error = %v", err)
+	}
+}
+
+func TestSymemoRuntimeRebuildWaitsForConcurrentClose(t *testing.T) {
+	root := t.TempDir()
+	config := symemo.Config{StorageRoot: filepath.Join(root, "storage"), IndexRoot: filepath.Join(root, "temp", "siyuanmemo")}
+	opens := 0
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		opens++
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	operationStarted := make(chan struct{})
+	releaseOperation := make(chan struct{})
+	operationDone := make(chan error, 1)
+	go func() {
+		operationDone <- hostRuntime.withEngine(func(*symemo.Engine) error {
+			close(operationStarted)
+			<-releaseOperation
+			return nil
+		})
+	}()
+	<-operationStarted
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- hostRuntime.Close() }()
+	for {
+		hostRuntime.mu.Lock()
+		draining := hostRuntime.draining
+		hostRuntime.mu.Unlock()
+		if draining {
+			break
+		}
+		runtime.Gosched()
+	}
+
+	rebuildStarted := make(chan struct{})
+	rebuildDone := make(chan error, 1)
+	go func() {
+		close(rebuildStarted)
+		rebuildDone <- hostRuntime.rebuild(t.Context())
+	}()
+	<-rebuildStarted
+	time.Sleep(100 * time.Millisecond)
+	hostRuntime.mu.Lock()
+	rebuildingDuringClose := hostRuntime.rebuilding
+	hostRuntime.mu.Unlock()
+	close(releaseOperation)
+	if err := <-operationDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	rebuildErr := <-rebuildDone
+	if rebuildingDuringClose {
+		t.Fatal("rebuild entered replacement while Close was draining")
+	}
+	if !errors.Is(rebuildErr, errSymemoRuntimeUninitialized) {
+		t.Fatalf("rebuild after Close error = %v", rebuildErr)
+	}
+	if opens != 1 {
+		t.Fatalf("concurrent Close/rebuild opened %d Engines", opens)
 	}
 }
 
@@ -858,19 +1158,170 @@ func TestSymemoServingEntrypointsPreserveRuntimeStartupBoundary(t *testing.T) {
 func TestSyncMergeProcessesSymemoAuthorityBeforeStorageGateOpens(t *testing.T) {
 	repositoryFile := parseGoTestFile(t, "repository.go")
 	calls := goCallNames(mustGoFunctionBody(t, repositoryFile, "processSyncMergeResult"))
-	if count := countGoCall(calls, "rebuildSymemoAfterSyncMerge"); count != 1 {
-		t.Fatalf("processSyncMergeResult calls rebuildSymemoAfterSyncMerge %d times", count)
+	if count := countGoCall(calls, "symemoSync.finish"); count != 2 {
+		t.Fatalf("processSyncMergeResult has %d guarded SiYuanMemo sync finishes", count)
 	}
-	assertGoCallOrder(t, "processSyncMergeResult", calls, []string{"rebuildSymemoAfterSyncMerge", "syncingStorages.Store"})
+	finishCalls := goCallNames(mustGoFunctionBody(t, repositoryFile, "finishSymemoRepositorySync"))
+	if count := countGoCall(finishCalls, "rebuildSymemoAfterSyncMerge"); count != 1 {
+		t.Fatalf("finishSymemoRepositorySync rebuilds SiYuanMemo %d times", count)
+	}
 }
 
-func TestSyncMergeBeginsRuntimeDrainBeforeClosingStorageGate(t *testing.T) {
+func TestRepositorySyncDrainsRuntimeBeforeAuthorityMerge(t *testing.T) {
 	repositoryFile := parseGoTestFile(t, "repository.go")
-	calls := goCallNames(mustGoFunctionBody(t, repositoryFile, "processSyncMergeResult"))
-	if count := countGoCall(calls, "workspaceSymemoRuntime.beginSyncDrain"); count != 1 {
-		t.Fatalf("processSyncMergeResult begins Runtime sync drain %d times", count)
+	beginCalls := goCallNames(mustGoFunctionBody(t, repositoryFile, "beginSymemoRepositorySync"))
+	assertGoCallOrder(t, "beginSymemoRepositorySync", beginCalls, []string{"activeSymemoRepositorySyncs.Add", "workspaceSymemoRuntime.beginSyncDrain"})
+	for _, test := range []struct {
+		function string
+		merge    string
+	}{
+		{function: "syncRepo", merge: "repo.Sync"},
+		{function: "syncRepoDownload", merge: "repo.SyncDownload"},
+	} {
+		calls := goCallNames(mustGoFunctionBody(t, repositoryFile, test.function))
+		assertGoCallOrder(t, test.function, calls, []string{"beginSymemoRepositorySync", "symemoSync.finish", test.merge, "symemoSync.recordMergeResult", "processSyncMergeResult"})
+		if count := countGoCall(calls, "symemoSync.finish"); count != 2 {
+			t.Errorf("%s has %d guarded SiYuanMemo sync finishes", test.function, count)
+		}
 	}
-	assertGoCallOrder(t, "processSyncMergeResult", calls, []string{"workspaceSymemoRuntime.beginSyncDrain", "syncingStorages.Store", "rebuildSymemoAfterSyncMerge"})
+}
+
+func TestPanickedRepositorySyncRebuildsAuthorityAndReopensGate(t *testing.T) {
+	config := runtimeSymemoFixtureConfig(t)
+	var opens atomic.Int32
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		opens.Add(1)
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	original := workspaceSymemoRuntime
+	workspaceSymemoRuntime = hostRuntime
+	t.Cleanup(func() {
+		syncingStorages.Store(false)
+		activeSymemoRepositorySyncs.Store(0)
+		workspaceSymemoRuntime = original
+		_ = hostRuntime.Close()
+	})
+
+	panicMarker := &struct{}{}
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != panicMarker {
+				t.Fatalf("repository sync panic = %#v", recovered)
+			}
+		}()
+		repositorySync := beginSymemoRepositorySync()
+		defer repositorySync.finish()
+		rewriteRuntimeFixturePrompt(t, config, "panic merge")
+		panic(panicMarker)
+	}()
+
+	if isSyncingStorages() {
+		t.Fatal("panicked repository sync left the storage gate closed")
+	}
+	if opens.Load() != 2 {
+		t.Fatalf("panicked repository sync opened %d Engines", opens.Load())
+	}
+	assertRuntimeFixturePrompt(t, hostRuntime, "panic merge")
+}
+
+func TestOverlappingRepositorySyncGuardsKeepStorageGateClosed(t *testing.T) {
+	config := runtimeSymemoFixtureConfig(t)
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	original := workspaceSymemoRuntime
+	workspaceSymemoRuntime = hostRuntime
+	t.Cleanup(func() {
+		syncingStorages.Store(false)
+		activeSymemoRepositorySyncs.Store(0)
+		workspaceSymemoRuntime = original
+		_ = hostRuntime.Close()
+	})
+
+	first := beginSymemoRepositorySync()
+	secondDone := make(chan *symemoRepositorySync, 1)
+	go func() { secondDone <- beginSymemoRepositorySync() }()
+	waitDeadline := time.NewTimer(time.Second)
+	defer waitDeadline.Stop()
+	for activeSymemoRepositorySyncs.Load() != 2 {
+		select {
+		case <-waitDeadline.C:
+			first.recordMergeResult(nil)
+			first.finish()
+			t.Fatal("overlapping repository sync did not register its storage-gate ownership")
+		default:
+			runtime.Gosched()
+		}
+	}
+
+	first.recordMergeResult(nil)
+	first.finish()
+	var second *symemoRepositorySync
+	select {
+	case second = <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second repository sync did not acquire the Runtime drain")
+	}
+	gateClosedAfterFirst := isSyncingStorages()
+	ownersAfterFirst := activeSymemoRepositorySyncs.Load()
+	second.recordMergeResult(nil)
+	second.finish()
+
+	if !gateClosedAfterFirst || ownersAfterFirst != 1 {
+		t.Fatalf("storage gate after first finish: closed=%t owners=%d", gateClosedAfterFirst, ownersAfterFirst)
+	}
+	if isSyncingStorages() || activeSymemoRepositorySyncs.Load() != 0 {
+		t.Fatal("final repository sync owner did not reopen the storage gate")
+	}
+	if _, err := hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryCurrentSession}); err != nil {
+		t.Fatalf("Runtime did not resume after all repository sync owners finished: %v", err)
+	}
+}
+
+func TestFailedRepositorySyncRebuildsChangedSymemoAuthorityBeforeGateOpens(t *testing.T) {
+	config := runtimeSymemoFixtureConfig(t)
+	var opens atomic.Int32
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		openCount := opens.Add(1)
+		if openCount > 1 && !isSyncingStorages() {
+			t.Error("failed sync opened storage gate before Runtime replacement")
+		}
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	original := workspaceSymemoRuntime
+	workspaceSymemoRuntime = hostRuntime
+	var repositorySync *symemoRepositorySync
+	t.Cleanup(func() {
+		repositorySync.finish()
+		syncingStorages.Store(false)
+		activeSymemoRepositorySyncs.Store(0)
+		workspaceSymemoRuntime = original
+		_ = hostRuntime.Close()
+	})
+
+	repositorySync = beginSymemoRepositorySync()
+	if !repositorySync.drained.acquired {
+		t.Fatal("available Runtime did not acquire failed sync drain")
+	}
+	rewriteRuntimeFixturePrompt(t, config, "failed merge")
+	repositorySync.recordMergeResult(&dejavu.MergeResult{Upserts: []*entity.File{{Path: "/storage/siyuanmemo/elements/" + runtimeSymemoFixtureElementID + ".sme"}}})
+	repositorySync.finish()
+	if isSyncingStorages() {
+		t.Fatal("failed sync left storage gate closed after replacement")
+	}
+	if opens.Load() != 2 {
+		t.Fatalf("failed sync opened %d Engines", opens.Load())
+	}
+	assertRuntimeFixturePrompt(t, hostRuntime, "failed merge")
 }
 
 func TestSyncRebuildDefersUntilRuntimeInitialization(t *testing.T) {
@@ -888,7 +1339,7 @@ func TestSyncRebuildDefersUntilRuntimeInitialization(t *testing.T) {
 		_ = hostRuntime.Close()
 	})
 
-	rebuildSymemoAfterSyncMerge(&dejavu.MergeResult{Upserts: []*entity.File{{Path: "/storage/siyuanmemo/reviews/2026-07.smr"}}})
+	rebuildSymemoAfterSyncMerge(&dejavu.MergeResult{Upserts: []*entity.File{{Path: "/storage/siyuanmemo/reviews/2026-07.smr"}}}, symemoSyncDrain{})
 	if opens != 0 || hostRuntime.state != symemoRuntimeUninitialized {
 		t.Fatalf("startup sync opened Runtime before initialization: opens=%d state=%d", opens, hostRuntime.state)
 	}
@@ -931,7 +1382,7 @@ func TestRebuildSymemoAfterSyncMergeFiltersAuthorityPaths(t *testing.T) {
 				_ = hostRuntime.Close()
 			})
 
-			rebuildSymemoAfterSyncMerge(test.mergeResult)
+			rebuildSymemoAfterSyncMerge(test.mergeResult, symemoSyncDrain{})
 			wantOpens := 1
 			if test.wantRebuild {
 				wantOpens = 2
@@ -995,7 +1446,7 @@ func TestRebuildSymemoAfterSyncMergePublishesChangedAuthority(t *testing.T) {
 				_ = hostRuntime.Close()
 			})
 			test.change(t, config)
-			rebuildSymemoAfterSyncMerge(test.mergeResult())
+			rebuildSymemoAfterSyncMerge(test.mergeResult(), symemoSyncDrain{})
 			test.verify(t, hostRuntime)
 		})
 	}
@@ -1043,7 +1494,7 @@ func TestRebuildSymemoAfterSyncMergePublishesChangedCreatedHTMLTopic(t *testing.
 		t.Fatal(err)
 	}
 
-	rebuildSymemoAfterSyncMerge(&dejavu.MergeResult{Upserts: []*entity.File{{Path: "/storage/siyuanmemo/elements/" + created.ElementID + ".sme"}}})
+	rebuildSymemoAfterSyncMerge(&dejavu.MergeResult{Upserts: []*entity.File{{Path: "/storage/siyuanmemo/elements/" + created.ElementID + ".sme"}}}, symemoSyncDrain{})
 	if opens.Load() != 2 {
 		t.Fatalf("sync replacement opened %d Engines", opens.Load())
 	}
@@ -1093,7 +1544,7 @@ func TestRebuildSymemoAfterSyncMergeDrainsLeaseAndExcludesStaleEngine(t *testing
 	<-operationStarted
 	rebuildDone := make(chan struct{})
 	go func() {
-		rebuildSymemoAfterSyncMerge(&dejavu.MergeResult{Upserts: []*entity.File{{Path: "/storage/siyuanmemo/reviews/2026-07.smr"}}})
+		rebuildSymemoAfterSyncMerge(&dejavu.MergeResult{Upserts: []*entity.File{{Path: "/storage/siyuanmemo/reviews/2026-07.smr"}}}, symemoSyncDrain{})
 		close(rebuildDone)
 	}()
 	for attempt := 0; attempt < 1000; attempt++ {
@@ -1152,7 +1603,7 @@ func TestRebuildSymemoAfterSyncMergeFailureLeavesRuntimeUnavailable(t *testing.T
 		_ = hostRuntime.Close()
 	})
 
-	rebuildSymemoAfterSyncMerge(&dejavu.MergeResult{Conflicts: []*entity.File{{Path: "/storage/siyuanmemo/elements/root.sme"}}})
+	rebuildSymemoAfterSyncMerge(&dejavu.MergeResult{Conflicts: []*entity.File{{Path: "/storage/siyuanmemo/elements/root.sme"}}}, symemoSyncDrain{})
 	if _, err := hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryCurrentSession}); err == nil {
 		t.Fatal("failed sync rebuild left Runtime available")
 	} else {
