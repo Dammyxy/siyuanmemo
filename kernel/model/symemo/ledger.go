@@ -37,6 +37,23 @@ type SchedulingLedger struct {
 	mu     sync.Mutex
 }
 
+type preparedSchedulingEventWrite struct {
+	path string
+	data []byte
+}
+
+type schedulingEventSerializationError struct {
+	cause error
+}
+
+func (err *schedulingEventSerializationError) Error() string {
+	return "serialize scheduling event envelope: " + err.cause.Error()
+}
+
+func (err *schedulingEventSerializationError) Unwrap() error {
+	return err.cause
+}
+
 func newSchedulingLedger(config Config, index *projectionIndex) *SchedulingLedger {
 	return &SchedulingLedger{config: config, index: index}
 }
@@ -88,6 +105,34 @@ func (ledger *SchedulingLedger) Commit(event SchedulingEvent) (SchedulingProject
 		return SchedulingProjection{}, false, domainErr
 	}
 	return SchedulingProjection{}, false, nil
+}
+
+func (ledger *SchedulingLedger) commitPrepared(event SchedulingEvent, marshal func(any, string, string) ([]byte, error), beforeCommit func() error) (bool, error) {
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	if event.EventID == "" || event.ElementID == "" || event.OccurredAt.IsZero() {
+		return false, domainError(ErrHistoryRequiresRepair, "review event identity is incomplete", nil)
+	}
+	_, found, err := ledger.findEventLocked(event.EventID)
+	if err != nil {
+		return false, err
+	}
+	if found {
+		return true, nil
+	}
+	prepared, err := ledger.prepareEventWriteLocked(event, marshal)
+	if err != nil {
+		return false, err
+	}
+	if err = beforeCommit(); err != nil {
+		return false, err
+	}
+	if err = ledger.writePreparedEventLocked(prepared); err != nil {
+		domainErr := wrapDomainError(ErrDurableWriteFailed, "persist scheduling event: %v", err)
+		domainErr.Retryable = true
+		return false, domainErr
+	}
+	return false, nil
 }
 
 type schedulingRefreshResult struct {
@@ -167,21 +212,26 @@ func (ledger *SchedulingLedger) findEventLocked(eventID string) (SchedulingEvent
 }
 
 func (ledger *SchedulingLedger) writeEventLocked(event SchedulingEvent) error {
-	month := monthFor(event.OccurredAt.In(ledger.config.Location))
-	path := filepath.Join(ledger.config.ReviewsRoot(), month+".smr")
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	prepared, err := ledger.prepareEventWriteLocked(event, json.MarshalIndent)
+	if err != nil {
 		return err
 	}
+	return ledger.writePreparedEventLocked(prepared)
+}
+
+func (ledger *SchedulingLedger) prepareEventWriteLocked(event SchedulingEvent, marshal func(any, string, string) ([]byte, error)) (preparedSchedulingEventWrite, error) {
+	month := monthFor(event.OccurredAt.In(ledger.config.Location))
+	path := filepath.Join(ledger.config.ReviewsRoot(), month+".smr")
 	file := EventFile{Spec: SupportedEventSpec, Month: month}
 	if data, err := filelock.ReadFile(path); err == nil {
 		if err = json.Unmarshal(data, &file); err != nil {
-			return err
+			return preparedSchedulingEventWrite{}, err
 		}
 		if file.Spec != SupportedEventSpec || file.Month != month {
-			return errors.New("event file envelope is incompatible")
+			return preparedSchedulingEventWrite{}, errors.New("event file envelope is incompatible")
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
+		return preparedSchedulingEventWrite{}, err
 	}
 	file.Events = append(file.Events, event)
 	sort.SliceStable(file.Events, func(i, j int) bool {
@@ -190,12 +240,19 @@ func (ledger *SchedulingLedger) writeEventLocked(event SchedulingEvent) error {
 		}
 		return file.Events[i].EventID < file.Events[j].EventID
 	})
-	data, err := json.MarshalIndent(file, "", "  ")
+	data, err := marshal(file, "", "  ")
 	if err != nil {
-		return err
+		return preparedSchedulingEventWrite{}, &schedulingEventSerializationError{cause: err}
 	}
 	data = append(data, '\n')
-	return filelock.WriteFile(path, data)
+	return preparedSchedulingEventWrite{path: path, data: data}, nil
+}
+
+func (ledger *SchedulingLedger) writePreparedEventLocked(prepared preparedSchedulingEventWrite) error {
+	if err := os.MkdirAll(filepath.Dir(prepared.path), 0755); err != nil {
+		return err
+	}
+	return filelock.WriteFile(prepared.path, prepared.data)
 }
 
 type eventGroup struct {

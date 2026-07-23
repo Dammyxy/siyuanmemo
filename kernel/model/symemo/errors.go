@@ -35,6 +35,8 @@ const (
 	ErrProjectionRefreshFailed         ErrorCode = "projection-refresh-failed"
 	ErrQueueAdvanceFailed              ErrorCode = "queue-advance-failed"
 	ErrHistoryRequiresRepair           ErrorCode = "history-requires-repair"
+	ErrInvalidCreateCommand            ErrorCode = "invalid-create-command"
+	ErrElementWritePartial             ErrorCode = "element-write-partial"
 	ErrElementNotFound                 ErrorCode = "element-not-found"
 	ErrElementSourceUnavailable        ErrorCode = "element-source-unavailable"
 	ErrElementSourceAmbiguous          ErrorCode = "element-source-ambiguous"
@@ -45,7 +47,10 @@ type DomainError struct {
 	Code            ErrorCode
 	Message         string
 	Retryable       bool
+	CreateAccepted  bool
 	ReviewAccepted  bool
+	ElementID       string
+	EventID         string
 	AcceptedEventID string
 	Session         *SessionState
 	Cause           error

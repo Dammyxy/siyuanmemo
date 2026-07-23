@@ -440,6 +440,7 @@ const (
 	materialInvalidBlock             = "invalid-block-reference"
 	materialEncrypted                = "encrypted-source-unsupported"
 	schedulingHistoryUnavailableCode = "unusable-scheduling-history"
+	missingTopicInitializationCode   = "missing-topic-initialization"
 )
 
 func (c Config) scanElements() (elementScanResult, error) {
@@ -647,6 +648,52 @@ func (c Config) loadSortRanks() (map[string]int, []ElementSourceDiagnostic) {
 	return ranks, nil
 }
 
+func (c Config) loadSortRanksForCreate() (map[string]int, error) {
+	ranks, diagnostics := c.loadSortRanks()
+	if len(diagnostics) != 0 {
+		return nil, domainError(ErrHistoryRequiresRepair, "Element sort metadata requires repair", nil)
+	}
+	if ranks == nil {
+		ranks = map[string]int{}
+	}
+	return ranks, nil
+}
+
+func nextTopLevelSortRank(records map[string]elementSourceRecord) int {
+	maxRank := -1
+	for _, record := range records {
+		if record.StorageKind != StorageKindRootDocument || record.ParentID != "" || record.SortRank == nil {
+			continue
+		}
+		if *record.SortRank > maxRank {
+			maxRank = *record.SortRank
+		}
+	}
+	return maxRank + 1
+}
+
+func (c Config) writeRootElementSource(element Element, data []byte) error {
+	path := filepath.Join(c.ElementsRoot(), element.ID+".sme")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	if err := filelock.WriteFile(path, data); err != nil {
+		return err
+	}
+	return invokeCreateHTMLTopicAuthorityFault("root")
+}
+
+func (c Config) writeTopLevelSortRanks(data []byte) error {
+	path := filepath.Join(c.ElementsRoot(), ".siyuan", "sort.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	if err := filelock.WriteFile(path, data); err != nil {
+		return err
+	}
+	return invokeCreateHTMLTopicAuthorityFault("sort")
+}
+
 func missingRootParents(root, relative string) []string {
 	clean := filepath.Clean(relative)
 	dirs := strings.Split(filepath.Dir(clean), string(filepath.Separator))
@@ -843,6 +890,16 @@ func sourceDiagnosticsWithMissingProjections(scan elementScanResult, projections
 			sourcePath = record.SourcePath
 		}
 		diagnostics = append(diagnostics, ElementSourceDiagnostic{SourcePath: sourcePath, ElementID: elementID, Code: schedulingHistoryUnavailableCode, Reason: "Scheduling history cannot produce a valid projection."})
+	}
+	for elementID, record := range scan.Records {
+		if _, projected := projections[elementID]; projected || historyElementIDs[elementID] {
+			continue
+		}
+		material := record.Element.Payload.Material
+		if record.Element.Type != "topic" || material == nil || material.CleaningPolicyVersion != topicHTMLCleaningPolicyVersion {
+			continue
+		}
+		diagnostics = append(diagnostics, ElementSourceDiagnostic{SourcePath: record.SourcePath, ElementID: elementID, Code: missingTopicInitializationCode, Reason: "HTML Topic initialization history is missing."})
 	}
 	return normalizeSourceDiagnostics(diagnostics)
 }

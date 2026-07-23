@@ -17,7 +17,9 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/88250/gulu"
@@ -35,6 +37,7 @@ var symemoBootMessage = func(progress int) string {
 }
 var symemoQuery = model.QuerySymemo
 var symemoRunLearningAction = model.RunSymemoLearningAction
+var symemoCreateElement = model.CreateSymemoElement
 
 var symemoLogError = func(code string, cause error) {
 	logging.LogErrorf("SiYuanMemo request failed [code=%s]: %s", code, cause)
@@ -59,6 +62,8 @@ var symemoSafeMessages = map[string]string{
 	string(symemo.ErrProjectionRefreshFailed):         "The review was saved, but its schedule could not be refreshed.",
 	string(symemo.ErrQueueAdvanceFailed):              "The review was saved, but the learning queue could not advance.",
 	string(symemo.ErrHistoryRequiresRepair):           "The review history requires repair.",
+	string(symemo.ErrInvalidCreateCommand):            "The Element could not be created.",
+	string(symemo.ErrElementWritePartial):             "The Element could not be created.",
 	string(symemo.ErrElementNotFound):                 "The Element was not found.",
 	string(symemo.ErrElementSourceUnavailable):        "The Element source is unavailable.",
 	string(symemo.ErrElementSourceAmbiguous):          "The Element source is ambiguous.",
@@ -77,6 +82,7 @@ func registerSymemoRoutes(ginServer *gin.Engine) {
 	ginServer.Handle("POST", "/api/symemo/getElementTree", model.CheckAuth, model.CheckAdminRole, getSymemoElementTree)
 	ginServer.Handle("POST", "/api/symemo/getElement", model.CheckAuth, model.CheckAdminRole, getSymemoElement)
 	ginServer.Handle("POST", "/api/symemo/getElementSourceDiagnostics", model.CheckAuth, model.CheckAdminRole, getSymemoElementSourceDiagnostics)
+	ginServer.Handle("POST", "/api/symemo/createHTMLTopic", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, createHTMLTopic)
 	ginServer.Handle("POST", "/api/symemo/startLearning", model.CheckAuth, model.CheckAdminRole, startSymemoLearning)
 	ginServer.Handle("POST", "/api/symemo/showAnswer", model.CheckAuth, model.CheckAdminRole, showSymemoAnswer)
 	ginServer.Handle("POST", "/api/symemo/gradeItem", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, gradeSymemoItem)
@@ -104,6 +110,11 @@ type symemoElementTreeRequest struct {
 type symemoElementDiagnosticsRequest struct {
 	ElementID  string `json:"elementId"`
 	SourcePath string `json:"sourcePath"`
+}
+
+type symemoCreateHTMLTopicRequest struct {
+	Title string `json:"title"`
+	HTML  string `json:"html"`
 }
 
 type symemoGradeRequest struct {
@@ -193,6 +204,21 @@ func getSymemoElementSourceDiagnostics(c *gin.Context) {
 	writeSymemoSuccess(c, struct {
 		Diagnostics []symemo.ElementSourceDiagnostic `json:"diagnostics"`
 	}{Diagnostics: result.Diagnostics})
+}
+func createHTMLTopic(c *gin.Context) {
+	var request symemoCreateHTMLTopicRequest
+	if !bindCreateHTMLTopicRequest(c, &request) {
+		return
+	}
+	if !ensureSymemoBooted(c) {
+		return
+	}
+	result, err := symemoCreateElement(c, symemo.CreateElementCommand{Kind: symemo.CreateElementAddNewTopic, AddNewTopic: symemo.AddNewTopicCommand{Title: request.Title, HTML: request.HTML}})
+	if err != nil {
+		writeSymemoError(c, err)
+		return
+	}
+	writeSymemoSuccess(c, result)
 }
 
 func redactSymemoElementAnswer(element *symemo.ElementReadView) *symemo.ElementReadView {
@@ -352,6 +378,26 @@ func bindSymemoRequest(c *gin.Context, request any) bool {
 	}
 	return true
 }
+func bindCreateHTMLTopicRequest(c *gin.Context, request *symemoCreateHTMLTopicRequest) bool {
+	var raw map[string]json.RawMessage
+	decoder := json.NewDecoder(c.Request.Body)
+	if err := decoder.Decode(&raw); err != nil || len(raw) != 2 {
+		writeSymemoFailure(c, symemoSafeMessage(symemoInvalidRequestCode), map[string]any{"errorCode": symemoInvalidRequestCode, "retryable": false})
+		return false
+	}
+	var trailing struct{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		writeSymemoFailure(c, symemoSafeMessage(symemoInvalidRequestCode), map[string]any{"errorCode": symemoInvalidRequestCode, "retryable": false})
+		return false
+	}
+	title, hasTitle := raw["title"]
+	html, hasHTML := raw["html"]
+	if !hasTitle || !hasHTML || json.Unmarshal(title, &request.Title) != nil || json.Unmarshal(html, &request.HTML) != nil {
+		writeSymemoFailure(c, symemoSafeMessage(symemoInvalidRequestCode), map[string]any{"errorCode": symemoInvalidRequestCode, "retryable": false})
+		return false
+	}
+	return true
+}
 
 func bindSymemoEmptyRequest(c *gin.Context) bool {
 	if c.Request.ContentLength == 0 {
@@ -380,7 +426,7 @@ func writeSymemoError(c *gin.Context, err error) {
 		if domainErr.Cause != nil {
 			symemoLogError(code, domainErr.Cause)
 		}
-		writeSymemoFailure(c, message, map[string]any{"errorCode": domainErr.Code, "retryable": domainErr.Retryable, "reviewAccepted": domainErr.ReviewAccepted, "acceptedEventId": domainErr.AcceptedEventID, "session": domainErr.Session})
+		writeSymemoFailure(c, message, map[string]any{"errorCode": domainErr.Code, "retryable": domainErr.Retryable, "createAccepted": domainErr.CreateAccepted, "reviewAccepted": domainErr.ReviewAccepted, "elementId": domainErr.ElementID, "eventId": domainErr.EventID, "acceptedEventId": domainErr.AcceptedEventID, "session": domainErr.Session})
 		return
 	}
 	symemoLogError(symemoInternalErrorCode, err)

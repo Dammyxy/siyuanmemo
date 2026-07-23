@@ -18,6 +18,7 @@ package symemo
 
 import (
 	"context"
+	"encoding/json"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -134,6 +135,17 @@ func copyElementTreeFixtureWorkspace(t *testing.T) Config {
 func newFixtureEngine(t *testing.T) (*Engine, Config) {
 	t.Helper()
 	config := copyFixtureWorkspace(t)
+	installFixtureSchedulerConfig(t, config)
+	engine, err := NewEngine(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	return engine, config
+}
+
+func installFixtureSchedulerConfig(t *testing.T, config Config) {
+	t.Helper()
 	if err := os.MkdirAll(config.SchedulerRoot, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -146,12 +158,6 @@ func newFixtureEngine(t *testing.T) (*Engine, Config) {
 			t.Fatal(err)
 		}
 	}
-	engine, err := NewEngine(context.Background(), config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = engine.Close() })
-	return engine, config
 }
 
 type fakeBlockReferenceReader struct {
@@ -198,4 +204,93 @@ func (reader *fakeBlockReferenceReader) sortedLookupIDs() []string {
 	ids := append([]string(nil), reader.lookupIDs...)
 	sort.Strings(ids)
 	return ids
+}
+
+type feature004AuthoritySnapshot struct {
+	ElementsRootFileCount int               `json:"elementsRootFileCount"`
+	ReviewsFileCount      int               `json:"reviewsFileCount"`
+	SortJSON              []byte            `json:"sortJson,omitempty"`
+	ElementSources        map[string][]byte `json:"elementSources"`
+	ReviewSources         map[string][]byte `json:"reviewSources"`
+	ProjectionSources     map[string][]byte `json:"projectionSources"`
+}
+
+func snapshotFeature004Authority(t *testing.T, config Config) feature004AuthoritySnapshot {
+	t.Helper()
+	snapshot := feature004AuthoritySnapshot{
+		ElementSources:    snapshotDirectoryFiles(t, config.ElementsRoot()),
+		ReviewSources:     snapshotDirectoryFiles(t, config.ReviewsRoot()),
+		ProjectionSources: snapshotDirectoryFiles(t, config.IndexRoot),
+	}
+	snapshot.ElementsRootFileCount = len(snapshot.ElementSources)
+	snapshot.ReviewsFileCount = len(snapshot.ReviewSources)
+	snapshot.SortJSON = append([]byte(nil), snapshot.ElementSources[filepath.ToSlash(filepath.Join(".siyuan", "sort.json"))]...)
+	return snapshot
+}
+
+func marshalFeature004AuthoritySnapshot(t *testing.T, snapshot feature004AuthoritySnapshot) []byte {
+	t.Helper()
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func snapshotDirectoryFiles(t *testing.T, root string) map[string][]byte {
+	t.Helper()
+	files := map[string][]byte{}
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return files
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		files[filepath.ToSlash(relative)] = data
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return files
+}
+
+func withCreateHTMLTopicNodeIDs(t *testing.T, elementID, eventID string) func() {
+	t.Helper()
+	previousElementID, previousEventID := newCreateHTMLTopicElementID, newCreateHTMLTopicEventID
+	newCreateHTMLTopicElementID = func() string { return elementID }
+	newCreateHTMLTopicEventID = func() string { return eventID }
+	restore := func() {
+		newCreateHTMLTopicElementID = previousElementID
+		newCreateHTMLTopicEventID = previousEventID
+	}
+	t.Cleanup(restore)
+	return restore
+}
+
+func withCreateHTMLTopicAuthorityFault(t *testing.T, stage string, err error) func() {
+	t.Helper()
+	previous := createHTMLTopicAuthorityFault
+	createHTMLTopicAuthorityFault = func(current string) error {
+		if current == stage {
+			return err
+		}
+		return nil
+	}
+	restore := func() { createHTMLTopicAuthorityFault = previous }
+	t.Cleanup(restore)
+	return restore
 }

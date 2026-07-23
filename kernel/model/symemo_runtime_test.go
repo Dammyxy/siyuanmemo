@@ -28,6 +28,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -360,6 +361,224 @@ func TestSymemoRuntimeAcceptedTriggerLatchesUntilExplicitRebuild(t *testing.T) {
 	}
 	if _, err = hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryCurrentSession}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSymemoRuntimeCreateElementUsesLeaseAndPublishedProjection(t *testing.T) {
+	config := runtimeSymemoFixtureConfig(t)
+	opens := 0
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		opens++
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hostRuntime.Close() })
+
+	result, err := hostRuntime.createElement(t.Context(), symemo.CreateElementCommand{
+		Kind: symemo.CreateElementAddNewTopic,
+		AddNewTopic: symemo.AddNewTopicCommand{
+			Title: "Runtime Topic",
+			HTML:  "<p>Runtime body</p>",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ElementID == "" || result.EventID == "" || !result.CreateAccepted || !result.ReviewAccepted || result.Topic == nil {
+		t.Fatalf("Runtime create result = %#v", result)
+	}
+	hostRuntime.mu.Lock()
+	active := hostRuntime.active
+	state := hostRuntime.state
+	hostRuntime.mu.Unlock()
+	if active != 0 || state != symemoRuntimeAvailable || opens != 1 {
+		t.Fatalf("Runtime create lease state active=%d state=%d opens=%d", active, state, opens)
+	}
+	query, err := hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryElement, ElementID: result.ElementID})
+	if err != nil || query.Element == nil || query.Element.Title != "Runtime Topic" || query.Element.ScheduleProjection == nil {
+		t.Fatalf("Runtime create query = %#v, err=%v", query.Element, err)
+	}
+}
+
+func TestSymemoRuntimePartialCreateReleasesLeaseDrainsAndPublishesReplacement(t *testing.T) {
+	config := runtimeSymemoFixtureConfig(t)
+	var opens atomic.Int32
+	replacementStarted := make(chan struct{}, 1)
+	var hostRuntime *symemoRuntime
+	hostRuntime = newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		if opens.Add(1) > 1 {
+			hostRuntime.mu.Lock()
+			active := hostRuntime.active
+			hostRuntime.mu.Unlock()
+			if active != 0 {
+				return nil, errors.New("replacement opened before Runtime leases drained")
+			}
+			replacementStarted <- struct{}{}
+		}
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hostRuntime.Close() })
+	hostRuntime.mu.Lock()
+	first := hostRuntime.engine
+	hostRuntime.mu.Unlock()
+
+	sortDirectory := filepath.Join(config.StorageRoot, "elements", ".siyuan")
+	if err := os.WriteFile(sortDirectory, []byte("blocks sort directory creation"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	operationStarted := make(chan struct{})
+	releaseOperation := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseOperation) }) }
+	t.Cleanup(release)
+	operationDone := make(chan error, 1)
+	go func() {
+		operationDone <- hostRuntime.withEngine(func(engine *symemo.Engine) error {
+			if engine != first {
+				return errors.New("in-flight operation received replacement Engine")
+			}
+			close(operationStarted)
+			<-releaseOperation
+			return nil
+		})
+	}()
+	<-operationStarted
+
+	type createOutcome struct {
+		result symemo.CreateElementResult
+		err    error
+	}
+	createDone := make(chan createOutcome, 1)
+	go func() {
+		result, err := hostRuntime.createElement(t.Context(), symemo.CreateElementCommand{
+			Kind:        symemo.CreateElementAddNewTopic,
+			AddNewTopic: symemo.AddNewTopicCommand{Title: "Partial Runtime Topic", HTML: "<p>Body</p>"},
+		})
+		createDone <- createOutcome{result: result, err: err}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		hostRuntime.mu.Lock()
+		draining := hostRuntime.draining
+		hostRuntime.mu.Unlock()
+		if draining {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("partial create did not begin Runtime rebuild")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case outcome := <-createDone:
+		t.Fatalf("partial create returned before in-flight lease drained: %#v", outcome)
+	default:
+	}
+	select {
+	case <-replacementStarted:
+		t.Fatal("replacement opened before in-flight lease drained")
+	default:
+	}
+	if _, err := hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryCurrentSession}); err == nil {
+		t.Fatal("draining Runtime accepted new work")
+	} else {
+		assertSymemoRuntimeCode(t, err, symemo.ErrProjectionRebuildFailed)
+	}
+
+	release()
+	if err := <-operationDone; err != nil {
+		t.Fatal(err)
+	}
+	outcome := <-createDone
+	domainErr, ok := symemo.AsDomainError(outcome.err)
+	if !ok || domainErr.Code != symemo.ErrElementWritePartial || outcome.result.ElementID == "" || outcome.result.EventID == "" {
+		t.Fatalf("partial create outcome = %#v, err=%#v", outcome.result, domainErr)
+	}
+	<-replacementStarted
+	if opens.Load() != 2 {
+		t.Fatalf("Engine opens = %d", opens.Load())
+	}
+	hostRuntime.mu.Lock()
+	replacement := hostRuntime.engine
+	active := hostRuntime.active
+	state := hostRuntime.state
+	hostRuntime.mu.Unlock()
+	if replacement == nil || replacement == first || active != 0 || state != symemoRuntimeAvailable {
+		t.Fatalf("replacement=%p first=%p active=%d state=%d", replacement, first, active, state)
+	}
+	query, err := hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryElement, ElementID: outcome.result.ElementID})
+	if err != nil || query.Element == nil || query.Element.ScheduleProjection != nil {
+		t.Fatalf("rebuilt partial root = %#v, err=%v", query.Element, err)
+	}
+	events, err := config.LoadEventFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.EventID == outcome.result.EventID {
+			t.Fatalf("partial create accepted event %#v", event)
+		}
+	}
+}
+
+func TestSymemoRuntimeAcceptedCreateLatchesUntilCompleteReplacement(t *testing.T) {
+	config := runtimeSymemoFixtureConfig(t)
+	var opens atomic.Int32
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		opens.Add(1)
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hostRuntime.Close() })
+
+	restoreProjection := installRuntimeProjectionRefreshFailure(t, config)
+	result, err := hostRuntime.createElement(t.Context(), symemo.CreateElementCommand{
+		Kind:        symemo.CreateElementAddNewTopic,
+		AddNewTopic: symemo.AddNewTopicCommand{Title: "Accepted Runtime Topic", HTML: "<p>Body</p>"},
+	})
+	domainErr, ok := symemo.AsDomainError(err)
+	if !ok || domainErr.Code != symemo.ErrProjectionRefreshFailed || !domainErr.CreateAccepted || !domainErr.ReviewAccepted || domainErr.Retryable || result.ElementID == "" || result.EventID == "" {
+		t.Fatalf("accepted create outcome = %#v, err=%#v", result, domainErr)
+	}
+	if opens.Load() != 1 {
+		t.Fatalf("accepted failure opened %d Engines", opens.Load())
+	}
+	if _, err = hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryElement, ElementID: result.ElementID}); err == nil {
+		t.Fatal("accepted projection failure exposed stale Runtime")
+	} else {
+		assertSymemoRuntimeCode(t, err, symemo.ErrProjectionRebuildFailed)
+	}
+
+	restoreProjection()
+	if err = hostRuntime.rebuild(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if opens.Load() != 2 {
+		t.Fatalf("replacement opened %d Engines", opens.Load())
+	}
+	query, err := hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryElement, ElementID: result.ElementID})
+	if err != nil || query.Element == nil || query.Element.ScheduleProjection == nil || query.Element.ScheduleProjection.AdoptedTerminalID != result.EventID {
+		t.Fatalf("replacement created Topic = %#v, err=%v", query.Element, err)
+	}
+	events, err := config.LoadEventFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := 0
+	for _, event := range events {
+		if event.EventID == result.EventID {
+			accepted++
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("accepted create event count = %d", accepted)
 	}
 }
 
@@ -779,6 +998,58 @@ func TestRebuildSymemoAfterSyncMergePublishesChangedAuthority(t *testing.T) {
 			rebuildSymemoAfterSyncMerge(test.mergeResult())
 			test.verify(t, hostRuntime)
 		})
+	}
+}
+
+func TestRebuildSymemoAfterSyncMergePublishesChangedCreatedHTMLTopic(t *testing.T) {
+	config := runtimeSymemoFixtureConfig(t)
+	var opens atomic.Int32
+	hostRuntime := newSymemoRuntime(func(ctx context.Context) (*symemo.Engine, error) {
+		opens.Add(1)
+		return symemo.NewEngine(ctx, config)
+	})
+	if err := hostRuntime.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	original := workspaceSymemoRuntime
+	workspaceSymemoRuntime = hostRuntime
+	t.Cleanup(func() {
+		workspaceSymemoRuntime = original
+		_ = hostRuntime.Close()
+	})
+
+	created, err := hostRuntime.createElement(t.Context(), symemo.CreateElementCommand{
+		Kind:        symemo.CreateElementAddNewTopic,
+		AddNewTopic: symemo.AddNewTopicCommand{Title: "Before Sync", HTML: "<p>Body</p>"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(config.StorageRoot, "elements", created.ElementID+".sme")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var element symemo.Element
+	if err = json.Unmarshal(data, &element); err != nil {
+		t.Fatal(err)
+	}
+	element.Title = "After Sync"
+	data, err = json.MarshalIndent(element, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, append(data, '\n'), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rebuildSymemoAfterSyncMerge(&dejavu.MergeResult{Upserts: []*entity.File{{Path: "/storage/siyuanmemo/elements/" + created.ElementID + ".sme"}}})
+	if opens.Load() != 2 {
+		t.Fatalf("sync replacement opened %d Engines", opens.Load())
+	}
+	query, err := hostRuntime.query(t.Context(), symemo.Query{Kind: symemo.QueryElement, ElementID: created.ElementID})
+	if err != nil || query.Element == nil || query.Element.Title != "After Sync" || query.Element.ScheduleProjection == nil || query.Element.ScheduleProjection.AdoptedTerminalID != created.EventID {
+		t.Fatalf("sync replacement Topic = %#v, err=%v", query.Element, err)
 	}
 }
 

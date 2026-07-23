@@ -43,6 +43,52 @@ func TestEngineContractClosedVariants(t *testing.T) {
 	}
 }
 
+func TestCreateElementAddNewTopicContractFields(t *testing.T) {
+	engine, config := newFixtureEngine(t)
+	before := marshalFeature004AuthoritySnapshot(t, snapshotFeature004Authority(t, config))
+
+	result, err := engine.CreateElement(context.Background(), CreateElementCommand{
+		Kind: CreateElementAddNewTopic,
+		AddNewTopic: AddNewTopicCommand{
+			Title: "  Contract Topic  ",
+			HTML:  `<p data-symemo-node-id="caller">Body</p>`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("AddNewTopic failed: %v", err)
+	}
+	if result.ElementID == "" || result.EventID == "" || !result.CreateAccepted || !result.ReviewAccepted || result.Retryable || result.Topic == nil {
+		t.Fatalf("AddNewTopic result = %#v", result)
+	}
+	if result.Topic.ElementID != result.ElementID || result.Topic.Title != "Contract Topic" || result.Topic.ProcessingState != "new" || result.Topic.ScheduleProfile != topicAFactorV1ID || result.Topic.AcceptedReviewAction != "NextTopic" {
+		t.Fatalf("created topic summary = %#v", result.Topic)
+	}
+	if result.Topic.PriorityPosition == nil || *result.Topic.PriorityPosition != 0 {
+		t.Fatalf("created topic priority = %#v", result.Topic)
+	}
+	if string(before) == string(marshalFeature004AuthoritySnapshot(t, snapshotFeature004Authority(t, config))) {
+		t.Fatal("AddNewTopic did not change authority")
+	}
+}
+
+func TestCreateElementInvalidAddNewTopicIsNonAcceptedAndLeavesAuthorityUnchanged(t *testing.T) {
+	engine, config := newFixtureEngine(t)
+	before := marshalFeature004AuthoritySnapshot(t, snapshotFeature004Authority(t, config))
+
+	result, err := engine.CreateElement(context.Background(), CreateElementCommand{
+		Kind:        CreateElementAddNewTopic,
+		AddNewTopic: AddNewTopicCommand{Title: "  ", HTML: "<p>Body</p>"},
+	})
+	domainErr, ok := AsDomainError(err)
+	if !ok || domainErr.Code != ErrInvalidCreateCommand || domainErr.CreateAccepted || domainErr.ReviewAccepted || domainErr.Retryable || domainErr.ElementID != "" || domainErr.EventID != "" {
+		t.Fatalf("invalid AddNewTopic error = %#v result=%#v", domainErr, result)
+	}
+	after := marshalFeature004AuthoritySnapshot(t, snapshotFeature004Authority(t, config))
+	if string(after) != string(before) {
+		t.Fatalf("invalid AddNewTopic changed authority\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
 func TestEngineContractErrorCodesAreStableAndDistinct(t *testing.T) {
 	codes := []ErrorCode{
 		ErrUnsupportedOperation,
@@ -56,6 +102,12 @@ func TestEngineContractErrorCodesAreStableAndDistinct(t *testing.T) {
 		ErrProjectionRefreshFailed,
 		ErrQueueAdvanceFailed,
 		ErrHistoryRequiresRepair,
+		ErrInvalidCreateCommand,
+		ErrElementWritePartial,
+		ErrElementNotFound,
+		ErrElementSourceUnavailable,
+		ErrElementSourceAmbiguous,
+		ErrProjectionRebuildFailed,
 	}
 	seen := map[ErrorCode]bool{}
 	for _, code := range codes {

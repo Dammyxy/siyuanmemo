@@ -133,6 +133,18 @@ func (runtime *symemoRuntime) learningAction(ctx context.Context, action symemo.
 	release(err)
 	return result, err
 }
+func (runtime *symemoRuntime) createElement(ctx context.Context, command symemo.CreateElementCommand) (symemo.CreateElementResult, error) {
+	engine, release, err := runtime.lease()
+	if err != nil {
+		return symemo.CreateElementResult{}, err
+	}
+	result, err := engine.CreateElement(ctx, command)
+	release(err)
+	if domainErr, ok := symemo.AsDomainError(err); ok && domainErr.Code == symemo.ErrElementWritePartial {
+		_ = runtime.rebuild(ctx)
+	}
+	return result, err
+}
 
 func (runtime *symemoRuntime) withEngine(operation func(*symemo.Engine) error) error {
 	engine, release, err := runtime.lease()
@@ -372,6 +384,9 @@ func QuerySymemo(ctx context.Context, query symemo.Query) (symemo.QueryResult, e
 
 func RunSymemoLearningAction(ctx context.Context, action symemo.LearningAction) (symemo.LearningResult, error) {
 	return workspaceSymemoRuntime.learningAction(ctx, action)
+}
+func CreateSymemoElement(ctx context.Context, command symemo.CreateElementCommand) (symemo.CreateElementResult, error) {
+	return workspaceSymemoRuntime.createElement(ctx, command)
 }
 
 func CloseSymemoEngine() error {

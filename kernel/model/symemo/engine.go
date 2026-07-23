@@ -21,17 +21,22 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"sync/atomic"
 )
 
 type Engine struct {
-	config              Config
-	schedulerConfigHash string
-	index               *projectionIndex
-	ledger              *SchedulingLedger
-	scheduler           *Scheduler
-	session             *learningSession
-	unavailable         atomic.Bool
+	config                    Config
+	creationMu                sync.Mutex
+	projectionMu              sync.Mutex
+	schedulerConfigHash       string
+	index                     *projectionIndex
+	ledger                    *SchedulingLedger
+	scheduler                 *Scheduler
+	session                   *learningSession
+	unavailable               atomic.Bool
+	beforeCreateHTMLTopicLock func()
+	beforeProjectionPublish   func()
 }
 
 func NewEngine(ctx context.Context, config Config) (*Engine, error) {
@@ -68,8 +73,27 @@ func (engine *Engine) Close() error {
 	return engine.index.close()
 }
 
-func (engine *Engine) CreateElement(context.Context, CreateElementCommand) (CreateElementResult, error) {
-	return CreateElementResult{}, domainError(ErrUnsupportedOperation, "CreateElement has no variants in item-learning-core", nil)
+func (engine *Engine) CreateElement(ctx context.Context, command CreateElementCommand) (CreateElementResult, error) {
+	if engine.unavailable.Load() {
+		return CreateElementResult{}, projectionRebuildFailedError()
+	}
+	switch command.Kind {
+	case CreateElementAddNewTopic:
+		if engine.config.ReadOnly {
+			return CreateElementResult{}, domainError(ErrUnsupportedOperation, "Element creation is unavailable in read-only mode", nil)
+		}
+		if engine.beforeCreateHTMLTopicLock != nil {
+			engine.beforeCreateHTMLTopicLock()
+		}
+		engine.creationMu.Lock()
+		defer engine.creationMu.Unlock()
+		if engine.unavailable.Load() {
+			return CreateElementResult{}, projectionRebuildFailedError()
+		}
+		return engine.createHTMLTopic(ctx, command.AddNewTopic)
+	default:
+		return CreateElementResult{}, domainError(ErrUnsupportedOperation, "unsupported CreateElement variant", nil)
+	}
 }
 
 func (engine *Engine) ChangeElement(context.Context, ChangeElementCommand) (ChangeElementResult, error) {
@@ -253,6 +277,8 @@ func (engine *Engine) refreshProjection(ctx context.Context) error {
 }
 
 func (engine *Engine) refreshProjectionWithConfig(ctx context.Context, effectiveConfig EffectiveSchedulerConfig) error {
+	engine.projectionMu.Lock()
+	defer engine.projectionMu.Unlock()
 	previous, err := engine.index.snapshot()
 	if err != nil {
 		previous = projectionSnapshot{Projections: map[string]SchedulingProjection{}, FinalDrillProjections: map[string]FinalDrillProjection{}}
@@ -294,6 +320,9 @@ func (engine *Engine) refreshProjectionWithConfig(ctx context.Context, effective
 		historyEventFingerprints = append(historyEventFingerprints, fingerprint)
 	}
 	sort.Strings(historyEventFingerprints)
+	if engine.beforeProjectionPublish != nil {
+		engine.beforeProjectionPublish()
+	}
 	return engine.index.replaceAll(ctx, projectionBuild{
 		Elements:                 elementScan.Elements,
 		Tree:                     tree,

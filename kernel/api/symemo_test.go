@@ -19,6 +19,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
@@ -45,6 +46,7 @@ func TestSymemoRoutes(t *testing.T) {
 		"POST /api/symemo/getElementTree":              false,
 		"POST /api/symemo/getElement":                  false,
 		"POST /api/symemo/getElementSourceDiagnostics": false,
+		"POST /api/symemo/createHTMLTopic":             false,
 		"POST /api/symemo/startLearning":               false,
 		"POST /api/symemo/showAnswer":                  false,
 		"POST /api/symemo/gradeItem":                   false,
@@ -316,6 +318,7 @@ func TestSymemoHandlersRemainTransportOnly(t *testing.T) {
 		`ginServer.Handle("POST", "/api/symemo/getElementTree", model.CheckAuth, model.CheckAdminRole, getSymemoElementTree)`,
 		`ginServer.Handle("POST", "/api/symemo/getElement", model.CheckAuth, model.CheckAdminRole, getSymemoElement)`,
 		`ginServer.Handle("POST", "/api/symemo/getElementSourceDiagnostics", model.CheckAuth, model.CheckAdminRole, getSymemoElementSourceDiagnostics)`,
+		`ginServer.Handle("POST", "/api/symemo/createHTMLTopic", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, createHTMLTopic)`,
 		`ginServer.Handle("POST", "/api/symemo/startLearning", model.CheckAuth, model.CheckAdminRole, startSymemoLearning)`,
 		`ginServer.Handle("POST", "/api/symemo/showAnswer", model.CheckAuth, model.CheckAdminRole, showSymemoAnswer)`,
 		`ginServer.Handle("POST", "/api/symemo/gradeItem", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, gradeSymemoItem)`,
@@ -723,4 +726,73 @@ func captureSymemoErrorLogs(t *testing.T) *[]capturedSymemoError {
 	}
 	t.Cleanup(func() { symemoLogError = previous })
 	return &logs
+}
+
+func TestCreateHTMLTopicRouteUsesStrictCreateFacade(t *testing.T) {
+	previousBooted := symemoIsBooted
+	previousCreate := symemoCreateElement
+	symemoIsBooted = func() bool { return true }
+	calls := 0
+	symemoCreateElement = func(_ context.Context, command symemo.CreateElementCommand) (symemo.CreateElementResult, error) {
+		calls++
+		if command.Kind != symemo.CreateElementAddNewTopic || command.AddNewTopic.Title != "HTML Topic" || command.AddNewTopic.HTML != "<p>Body</p>" {
+			t.Fatalf("create command = %#v", command)
+		}
+		priority := 0.0
+		return symemo.CreateElementResult{ElementID: "20260723090000-topicxx", EventID: "20260723090100-eventxx", CreateAccepted: true, ReviewAccepted: true, Topic: &symemo.CreatedTopicSummary{ElementID: "20260723090000-topicxx", Title: "HTML Topic", ScheduleProfile: "topic-afactor-v1", AcceptedReviewAction: "NextTopic", PriorityPosition: &priority}}, nil
+	}
+	t.Cleanup(func() { symemoIsBooted = previousBooted; symemoCreateElement = previousCreate })
+
+	response := invokeSymemoHandler(t, createHTMLTopic, `{"title":"HTML Topic","html":"<p>Body</p>"}`)
+	if code := envelopeCode(t, response); code != 0 || calls != 1 {
+		t.Fatalf("create envelope=%s calls=%d", response.Body.String(), calls)
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `"elementId":"20260723090000-topicxx"`) || !strings.Contains(body, `"createAccepted":true`) || !strings.Contains(body, `"reviewAccepted":true`) {
+		t.Fatalf("create success body = %s", body)
+	}
+}
+
+func TestCreateHTMLTopicStrictBindingRejectsMissingOrUnknownInputs(t *testing.T) {
+	previousBooted := symemoIsBooted
+	previousCreate := symemoCreateElement
+	symemoIsBooted = func() bool { return true }
+	calls := 0
+	symemoCreateElement = func(context.Context, symemo.CreateElementCommand) (symemo.CreateElementResult, error) {
+		calls++
+		return symemo.CreateElementResult{}, nil
+	}
+	t.Cleanup(func() { symemoIsBooted = previousBooted; symemoCreateElement = previousCreate })
+
+	for _, body := range []string{`{"title":"Only title"}`, `{"title":"Topic","html":"<p>Body</p>","elementId":"caller"}`, `{"title":1,"html":"<p>Body</p>"}`} {
+		response := invokeSymemoHandler(t, createHTMLTopic, body)
+		assertSymemoFailure(t, response, symemoInvalidRequestCode, "Invalid request.")
+	}
+	if calls != 0 {
+		t.Fatalf("strict binding called create facade %d times", calls)
+	}
+}
+
+func TestCreateHTMLTopicFailureEnvelopeCarriesSafeCreateFields(t *testing.T) {
+	previousBooted := symemoIsBooted
+	previousCreate := symemoCreateElement
+	symemoIsBooted = func() bool { return true }
+	symemoCreateElement = func(context.Context, symemo.CreateElementCommand) (symemo.CreateElementResult, error) {
+		return symemo.CreateElementResult{}, &symemo.DomainError{Code: symemo.ErrElementWritePartial, ElementID: "20260723090000-topicxx", EventID: "20260723090100-eventxx", CreateAccepted: false, ReviewAccepted: false, Retryable: false, Cause: errors.New("H:\\secret\\memo.db raw <script>")}
+	}
+	t.Cleanup(func() { symemoIsBooted = previousBooted; symemoCreateElement = previousCreate })
+
+	response := invokeSymemoHandler(t, createHTMLTopic, `{"title":"Topic","html":"<p>Body</p>"}`)
+	assertSymemoFailure(t, response, string(symemo.ErrElementWritePartial), "The Element could not be created.")
+	body := response.Body.String()
+	for _, want := range []string{`"elementId":"20260723090000-topicxx"`, `"eventId":"20260723090100-eventxx"`, `"createAccepted":false`, `"reviewAccepted":false`, `"retryable":false`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("failure body missing %s: %s", want, body)
+		}
+	}
+	for _, forbidden := range []string{"H:\\secret", "memo.db", "<script>"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("failure body leaked %q: %s", forbidden, body)
+		}
+	}
 }

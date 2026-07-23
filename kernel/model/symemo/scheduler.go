@@ -62,11 +62,18 @@ func (scheduler *Scheduler) BuildLearningPlan(ctx context.Context) (learningPlan
 	if err != nil {
 		return learningPlan{}, err
 	}
+	blockedElementIDs, err := scheduler.blockedElementIDs(snapshot)
+	if err != nil {
+		return learningPlan{}, err
+	}
 	if scheduler.refreshProjection != nil && finalDrillExpiryRefreshRequired(snapshot.FinalDrillProjections, learningDayID) {
 		if err = scheduler.refreshProjection(ctx); err != nil {
 			return learningPlan{}, err
 		}
 		if snapshot, err = scheduler.index.snapshot(); err != nil {
+			return learningPlan{}, err
+		}
+		if blockedElementIDs, err = scheduler.blockedElementIDs(snapshot); err != nil {
 			return learningPlan{}, err
 		}
 	}
@@ -110,7 +117,7 @@ func (scheduler *Scheduler) BuildLearningPlan(ctx context.Context) (learningPlan
 		sort.Strings(orderedIDs)
 	}
 	for _, id := range orderedIDs {
-		if snapshot.BlockedElementIDs[id] || unavailableMaterial[id] {
+		if blockedElementIDs[id] || unavailableMaterial[id] {
 			continue
 		}
 		element, ok := snapshot.Elements[id]
@@ -141,6 +148,23 @@ func (scheduler *Scheduler) BuildLearningPlan(ctx context.Context) (learningPlan
 		return plan.FinalDrill[i].ElementID < plan.FinalDrill[j].ElementID
 	})
 	return plan, nil
+}
+
+func (scheduler *Scheduler) blockedElementIDs(snapshot projectionSnapshot) (map[string]bool, error) {
+	blocked := map[string]bool{}
+	for id := range snapshot.BlockedElementIDs {
+		blocked[id] = true
+	}
+	diagnostics, err := scheduler.index.sourceDiagnostics()
+	if err != nil {
+		return nil, err
+	}
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Code == missingTopicInitializationCode && diagnostic.ElementID != "" {
+			blocked[diagnostic.ElementID] = true
+		}
+	}
+	return blocked, nil
 }
 
 func finalDrillExpiryRefreshRequired(projections map[string]FinalDrillProjection, learningDayID string) bool {
@@ -404,6 +428,72 @@ func (scheduler *Scheduler) ApplyTopicNext(ctx context.Context, target ReviewTar
 		}
 	}
 	return scheduleApplyResult{Projection: projection, Event: event, AlreadyAccepted: alreadyAccepted}, nil
+}
+
+func (scheduler *Scheduler) planTopicIntroduction(elementID, eventID string) (SchedulingEvent, error) {
+	if elementID == "" || eventID == "" {
+		return SchedulingEvent{}, domainError(ErrInvalidCreateCommand, "Topic creation requires generated identities", nil)
+	}
+	effective := scheduler.config.LoadEffectiveSchedulerConfig()
+	now := scheduler.config.Now()
+	learningDayID := effective.ResolveLearningDayID(now)
+	seed := topicInitialSeed(eventID, elementID)
+	interval := topicInitialInterval(seed)
+	nextDay := addLearningDays(learningDayID, interval)
+	dueAt, err := effective.TimeForLearningDayID(nextDay)
+	if err != nil {
+		return SchedulingEvent{}, err
+	}
+	before := SchedulingProjection{ElementID: elementID, LifecycleState: "pending", PriorityPosition: 0}
+	after := SchedulingProjection{
+		ElementID:            elementID,
+		ScheduleProfile:      topicAFactorV1ID,
+		AcceptedReviewAction: "NextTopic",
+		LifecycleState:       "memorized",
+		AdoptedTerminalID:    eventID,
+		DueAt:                dueAt,
+		DueLearningDay:       nextDay,
+		IntervalDays:         interval,
+		Repetitions:          1,
+		LastReviewAt:         timePointer(now),
+		LastLearningDate:     learningDayID,
+		ActiveAlgorithm:      topicAFactorV1ID,
+		AlgorithmStates: map[string]VersionedAlgorithmState{
+			topicAFactorV1ID: {
+				Algorithm:     topicAFactorV1ID,
+				SchemaVersion: 1,
+				State: TopicAFactorV1State{
+					IntervalDays:     interval,
+					Repetitions:      1,
+					LastLearningDay:  learningDayID,
+					DueLearningDay:   nextDay,
+					EffectiveAFactor: scheduler.topic.config.AFactor,
+				},
+			},
+		},
+		PriorityPosition: 0,
+	}
+	return SchedulingEvent{
+		Spec:                      SupportedEventSpec,
+		EventID:                   eventID,
+		OccurredAt:                now,
+		Type:                      "introduceElement",
+		ElementID:                 elementID,
+		ReviewKind:                "introduceTopic",
+		LearningDate:              learningDayID,
+		LearningDayID:             learningDayID,
+		TopicPolicyVersion:        "siyuanmemo-topic-initial-v1",
+		TopicInitialIntervalDays:  interval,
+		TopicPreviousIntervalDays: 0,
+		TopicEffectiveAFactor:     scheduler.topic.config.AFactor,
+		TopicNextIntervalDays:     interval,
+		TopicMinimumIntervalDays:  scheduler.topic.config.MinimumIntervalDays,
+		TopicMaximumIntervalDays:  scheduler.topic.config.MaximumIntervalDays,
+		TopicSkipPolicy:           scheduler.topic.config.SkipPolicy,
+		TopicSeed:                 seed,
+		Before:                    before,
+		After:                     after,
+	}, nil
 }
 
 func (scheduler *Scheduler) ApplyDrillGrade(ctx context.Context, target ReviewTarget, eventID, sessionID string, rawGrade int) (scheduleApplyResult, error) {

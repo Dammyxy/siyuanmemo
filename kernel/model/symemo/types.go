@@ -98,11 +98,12 @@ func (payload ElementPayload) MarshalJSON() ([]byte, error) {
 }
 
 type TopicMaterial struct {
-	Kind             string          `json:"kind"`
-	HTML             string          `json:"html,omitempty"`
-	BlockID          string          `json:"blockId,omitempty"`
-	SourceNotebookID string          `json:"sourceNotebookId,omitempty"`
-	Raw              json.RawMessage `json:"-"`
+	Kind                  string          `json:"kind"`
+	HTML                  string          `json:"html,omitempty"`
+	CleaningPolicyVersion string          `json:"cleaningPolicyVersion,omitempty"`
+	BlockID               string          `json:"blockId,omitempty"`
+	SourceNotebookID      string          `json:"sourceNotebookId,omitempty"`
+	Raw                   json.RawMessage `json:"-"`
 }
 
 func (material *TopicMaterial) UnmarshalJSON(data []byte) error {
@@ -521,9 +522,50 @@ type LearningResult struct {
 	Session              *SessionState         `json:"session,omitempty"`
 }
 
-type CreateElementCommand struct{ Kind string }
+type CreateElementKind string
+
+const (
+	CreateElementAddNewTopic CreateElementKind = "AddNewTopic"
+)
+
+type AddNewTopicCommand struct {
+	Title string `json:"title"`
+	HTML  string `json:"html"`
+}
+
+type CreateElementCommand struct {
+	Kind        CreateElementKind  `json:"kind"`
+	AddNewTopic AddNewTopicCommand `json:"addNewTopic,omitempty"`
+}
+
 type ChangeElementCommand struct{ Kind string }
 type SendToNoteCommand struct{ Kind string }
-type CreateElementResult struct{}
+
+type CreatedTopicSummary struct {
+	ElementID             string     `json:"elementId"`
+	Title                 string     `json:"title,omitempty"`
+	ProcessingState       string     `json:"processingState,omitempty"`
+	SourcePath            string     `json:"sourcePath,omitempty"`
+	SortRank              *int       `json:"sortRank,omitempty"`
+	LifecycleState        string     `json:"lifecycleState,omitempty"`
+	ScheduleProfile       string     `json:"scheduleProfile,omitempty"`
+	AcceptedReviewAction  string     `json:"acceptedReviewAction,omitempty"`
+	PriorityPosition      *float64   `json:"priorityPosition,omitempty"`
+	DueLearningDay        string     `json:"dueLearningDay,omitempty"`
+	InitialIntervalDays   int        `json:"initialIntervalDays,omitempty"`
+	AdoptedTerminalEvent  string     `json:"adoptedTerminalEventId,omitempty"`
+	CleaningPolicyVersion string     `json:"cleaningPolicyVersion,omitempty"`
+	DueAt                 *time.Time `json:"dueAt,omitempty"`
+}
+
+type CreateElementResult struct {
+	ElementID      string               `json:"elementId,omitempty"`
+	EventID        string               `json:"eventId,omitempty"`
+	CreateAccepted bool                 `json:"createAccepted"`
+	ReviewAccepted bool                 `json:"reviewAccepted"`
+	Retryable      bool                 `json:"retryable"`
+	Topic          *CreatedTopicSummary `json:"topic,omitempty"`
+}
+
 type ChangeElementResult struct{}
 type SendToNoteResult struct{}
